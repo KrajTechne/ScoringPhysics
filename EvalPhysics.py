@@ -1,11 +1,13 @@
 import os
 import biotite
 import pandas as pd
+import numpy as np
 import pyrosetta as pr
+import biotite.structure as struc
+import biotite.structure.io.pdb as pdb
+import biotite.sequence as seq
 from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
-from pyrosetta.rosetta.core.select.residue_selector import ResidueIndexSelector, NeighborhoodResidueSelector, AndResidueSelector, ChainSelector
-from pyrosetta.rosetta.core.select import get_residues_from_subset
 from pyrosetta.rosetta.core.kinematics import MoveMap
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 
@@ -82,34 +84,83 @@ def relax_pdb(pdb_file_path: str, save_relaxed: bool = True) -> pr.Pose:
         relaxed_pdb_file_path = os.path.join(relaxed_pdb_folder_path, os.path.basename(pdb_file_path))
         pose.dump_pdb(relaxed_pdb_file_path)
         print(f"Saved relaxed PDB file: {relaxed_pdb_file_path}")
-    
+        
     return pose
 
-def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B") -> dict:
-    """ Analyzes the interface of a PyRosetta Relaxed pose using PyRosetta's InterfaceAnalyzerMover """
-    # Check if relaxed pose still utilizes the same epitope residues, specified earlier in design
-    epi_res_string = ",".join(f"{res_index}{target_chain_id}" for res_index in epi_residues)
-    epitope_selector = ResidueIndexSelector(epi_res_string)
-    binder_chain_selector = ChainSelector(binder_chain_id)
-    neighborhood_selector = NeighborhoodResidueSelector(epitope_selector, 4.5, False)
-    contact_selector = AndResidueSelector(neighborhood_selector, binder_chain_selector)
-    # Count them
-    subset = contact_selector.apply(pose)
-    epitope_contact_count = sum(subset) # subset is a list of True/False
-    # Get the Rosetta internal numbers (e.g., [1, 5, 6])
-    contact_indices = get_residues_from_subset(subset)
-    
-    # Convert them to PDB strings (e.g., ["10A", "14A", "15A"])
-    contact_ids = []
-    for i in contact_indices:
-        pdb_id = pose.pdb_info().pose2pdb(i) # Returns format like "10 A"
-        # Optional: Clean up the string to look like "10A"
-        clean_id = pdb_id.strip().replace(" ", "") 
-        contact_ids.append(clean_id)
-        
-    # Join them into a single string for the CSV
-    contact_list_str = ";".join(contact_ids)
+def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: list, binder_chain_id: str = "A", 
+                                target_chain_id: str = "B", cutoff: float = 4.5) -> dict:
+    """
+        Answer and achieve these objectives:
+        1. Which residues of the binder chain are in contact with the target chain? (Actual Paratope)
+        2. Which residues of the target chain are in contact with the binder chain? (Actual Epitope)
+        3. Calculate percent of desired epitope residues covered by actual epitope (Desired Epitope % Coverage)
+    """
+    obj_protein_seq = seq.ProteinSequence()
+    # Make sure list of integers for set intersection
+    desired_epitope_residues = [int(x) for x in desired_epitope_residues] 
 
+    pdb_file = pdb.PDBFile.read(pdb_file_path)
+    pdb_atom_array = pdb_file.get_structure(model = 1)
+    
+    # Return specific chain's heavy atoms' atom array
+    binder_atom_array = pdb_atom_array[(pdb_atom_array.chain_id == binder_chain_id) & (pdb_atom_array.element != "H")]
+    target_atom_array = pdb_atom_array[(pdb_atom_array.chain_id == target_chain_id) & (pdb_atom_array.element != "H")]
+
+    # Create ROI Cell List: Based on target atom array
+    # Create target_binder_adjacency_matrix (shape): (# of Target Heavy atoms, # of Binder Heavy atoms)
+    roi_cell_list = struc.CellList(atom_array = target_atom_array, cell_size = cutoff)
+    target_binder_adjacency_matrix = roi_cell_list.get_atoms(binder_atom_array.coord, radius = cutoff, as_mask= True)
+
+    # Isolate Target's Heavy Contact Atoms Indices
+    contact_atom_indices_target = np.any(target_binder_adjacency_matrix, axis = 0) # Collapse along axis 0 (target atoms)
+    contact_atom_indices_binder = np.any(target_binder_adjacency_matrix, axis = 1) # Collapse along axis 1 (binder atoms)
+
+    target_contact_atom_array = target_atom_array[contact_atom_indices_target]
+    binder_contact_atom_array = binder_atom_array[contact_atom_indices_binder]
+    
+
+    epitope_indices, epitope_3aa = struc.get_residues(target_contact_atom_array)
+    paratope_indices, paratope_3aa = struc.get_residues(binder_contact_atom_array)
+        
+    # Convert Residue Indices into Single String
+    paratope_indices_str = ",".join(f"{res_index}" for res_index in paratope_indices)
+    epitope_indices_str = ",".join(f"{res_index}" for res_index in epitope_indices)
+
+    # Extract Paratope & Epitope 1-letter AA Strings
+    paratope_1aa = "".join([obj_protein_seq.convert_letter_3to1(para_3aa) for para_3aa in paratope_3aa])
+    epitope_1aa = "".join([obj_protein_seq.convert_letter_3to1(epi_3aa) for epi_3aa in epitope_3aa])
+
+    # Count # of Residues
+    paratope_length, epitope_length = len(paratope_indices), len(epitope_indices)
+    
+    # Determine Percent Coverage of Desired Epitope Residues in Actual Epitope Residues
+    epitope_indices_set = set(epitope_indices)
+    epitope_coverage =  epitope_indices_set.intersection(desired_epitope_residues)
+    percent_coverage = len(epitope_coverage) / len(desired_epitope_residues)
+
+    contact_information = {
+        "binder_chain": binder_chain_id,
+        "target_chain": target_chain_id,
+        "paratope_indices": paratope_indices_str,
+        "paratope_length": paratope_length,
+        "paratope_1aa": paratope_1aa,
+        "epitope_indices": epitope_indices_str,
+        "epitope_length": epitope_length,
+        "epitope_1aa": epitope_1aa,
+        "desired_epitope_coverage": percent_coverage
+    }
+    return contact_information
+
+def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B",
+                      cutoff: float = 4.5) -> dict:
+    """ Analyzes the interface of a PyRosetta Relaxed pose using PyRosetta's InterfaceAnalyzerMover """
+
+    # Convert relaxed pose into PDB file for extracting contact information
+    temp_pdb_file_path = "/tmp/temp.pdb"
+    pose.dump_pdb(temp_pdb_file_path)
+    contact_information = determine_binding_interface(pdb_file_path = temp_pdb_file_path, desired_epitope_residues = epi_residues,
+                                                      binder_chain_id = binder_chain_id, target_chain_id = target_chain_id,
+                                                      cutoff= cutoff)
 
     # Initialize Interface Analyzer
     interface_analyzer = InterfaceAnalyzerMover()
@@ -137,8 +188,6 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = 
 
     # Save output in a dictionary
     interface_metrics = {
-        "epitope_contact_count": epitope_contact_count,
-        "contact_list": contact_list_str,
         "interface_sc": interface_sc,
         "binding_interface_hbonds": binding_interface_hbonds,
         "interface_dG": interface_dG,
@@ -146,10 +195,12 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = 
         "interface_packstat": interface_packstat,
         "interface_dG_SASA_ratio": interface_dG_SASA_ratio
     }
-    return interface_metrics
+    # Combine both contact information and interface metrics dictionaries into one
+    full_interface_metrics = {**contact_information, **interface_metrics}
+    return full_interface_metrics
 
 def run_relaxation_and_physics_scoring(pdb_folder_path: str, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B", 
-                                       save_relaxed: bool = False):
+                                       save_relaxed: bool = False, cutoff: float = 4.5):
     """ Runs relaxation and physics scoring on a set of PDB Files containing promising designs from structure-based design workflow """
     # Create initial list of dictionaries to store results
     all_interface_metrics = []
