@@ -10,6 +10,7 @@ from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.core.kinematics import MoveMap
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
+from StrucTools import run_superimpose_and_calculate_rmsd_apo_holo_pipeline, determine_binding_interface
 
 # Initialize PyRosetta
 # We use the same flags to ensure the scoring physics matches the original pipeline
@@ -87,77 +88,10 @@ def relax_pdb(pdb_file_path: str, save_relaxed: bool = True) -> pr.Pose:
         
     return pose
 
-def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: list, binder_chain_id: str = "A", 
-                                target_chain_id: str = "B", cutoff: float = 4.5) -> dict:
-    """
-        Answer and achieve these objectives:
-        1. Which residues of the binder chain are in contact with the target chain? (Actual Paratope)
-        2. Which residues of the target chain are in contact with the binder chain? (Actual Epitope)
-        3. Calculate percent of desired epitope residues covered by actual epitope (Desired Epitope % Coverage)
-    """
-    obj_protein_seq = seq.ProteinSequence()
-    # Make sure list of integers for set intersection
-    desired_epitope_residues = [int(x) for x in desired_epitope_residues] 
-
-    pdb_file = pdb.PDBFile.read(pdb_file_path)
-    pdb_atom_array = pdb_file.get_structure(model = 1)
-    
-    # Return specific chain's heavy atoms' atom array
-    binder_atom_array = pdb_atom_array[(pdb_atom_array.chain_id == binder_chain_id) & (pdb_atom_array.element != "H")]
-    target_atom_array = pdb_atom_array[(pdb_atom_array.chain_id == target_chain_id) & (pdb_atom_array.element != "H")]
-
-    # Create ROI Cell List: Based on target atom array
-    # Create target_binder_adjacency_matrix (shape): (# of Target Heavy atoms, # of Binder Heavy atoms)
-    roi_cell_list = struc.CellList(atom_array = target_atom_array, cell_size = cutoff)
-    target_binder_adjacency_matrix = roi_cell_list.get_atoms(binder_atom_array.coord, radius = cutoff, as_mask= True)
-
-    # Isolate Target's Heavy Contact Atoms Indices
-    contact_atom_indices_target = np.any(target_binder_adjacency_matrix, axis = 0) # Collapse along axis 0 (target atoms)
-    contact_atom_indices_binder = np.any(target_binder_adjacency_matrix, axis = 1) # Collapse along axis 1 (binder atoms)
-
-    target_contact_atom_array = target_atom_array[contact_atom_indices_target]
-    binder_contact_atom_array = binder_atom_array[contact_atom_indices_binder]
-    
-
-    epitope_indices, epitope_3aa = struc.get_residues(target_contact_atom_array)
-    paratope_indices, paratope_3aa = struc.get_residues(binder_contact_atom_array)
-        
-    # Convert Residue Indices into Single String
-    paratope_indices_str = ",".join(f"{res_index}" for res_index in paratope_indices)
-    epitope_indices_str = ",".join(f"{res_index}" for res_index in epitope_indices)
-
-    # Extract Paratope & Epitope 1-letter AA Strings
-    paratope_1aa = "".join([obj_protein_seq.convert_letter_3to1(para_3aa) for para_3aa in paratope_3aa])
-    epitope_1aa = "".join([obj_protein_seq.convert_letter_3to1(epi_3aa) for epi_3aa in epitope_3aa])
-
-    # Count # of Residues
-    paratope_length, epitope_length = len(paratope_indices), len(epitope_indices)
-    
-    # Determine Percent Coverage of Desired Epitope Residues in Actual Epitope Residues
-    epitope_indices_set = set(epitope_indices)
-    epitope_coverage =  epitope_indices_set.intersection(desired_epitope_residues)
-    percent_coverage = len(epitope_coverage) / len(desired_epitope_residues)
-
-    contact_information = {
-        "binder_chain": binder_chain_id,
-        "target_chain": target_chain_id,
-        "paratope_indices": paratope_indices_str,
-        "paratope_length": paratope_length,
-        "paratope_1aa": paratope_1aa,
-        "epitope_indices": epitope_indices_str,
-        "epitope_length": epitope_length,
-        "epitope_1aa": epitope_1aa,
-        "desired_epitope_coverage": percent_coverage
-    }
-    return contact_information
-
-def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B",
+def analyze_interface(pose: pr.Pose, epi_residues: list,temp_pdb_file_path: str = "/tmp/temp.pdb", binder_chain_id: str = "A", target_chain_id: str = "B",
                       cutoff: float = 4.5) -> dict:
     """ Analyzes the interface of a PyRosetta Relaxed pose using PyRosetta's InterfaceAnalyzerMover """
 
-    # Convert relaxed pose into PDB file for extracting contact information
-    temp_pdb_file_path = "/tmp/temp.pdb"
-    pose.dump_pdb(temp_pdb_file_path)
     contact_information = determine_binding_interface(pdb_file_path = temp_pdb_file_path, desired_epitope_residues = epi_residues,
                                                       binder_chain_id = binder_chain_id, target_chain_id = target_chain_id,
                                                       cutoff= cutoff)
@@ -199,19 +133,44 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, binder_chain_id: str = 
     full_interface_metrics = {**contact_information, **interface_metrics}
     return full_interface_metrics
 
-def run_relaxation_and_physics_scoring(pdb_folder_path: str, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B", 
+def run_relaxation_and_physics_scoring_single_pdb(pdb_file_path: str, epi_residues: list,rmsd_inputs: dict = {},
+                                                  binder_chain_id: str = "A", target_chain_id: str = "B", 
+                                                  save_relaxed: bool = False, cutoff: float = 4.5):
+    """ Runs relaxation and physics scoring on a single PDB File containing a promising design from structure-based design workflow """
+    print(f"Processing PDB file: {pdb_file_path}")
+    # 1. Relax PDB File
+    relaxed_pose = relax_pdb(pdb_file_path= pdb_file_path, save_relaxed= save_relaxed) 
+    # 2. Convert relaxed pose into PDB file for extracting contact information & calculating RMSD between relaxed holo and apo structures
+    temp_pdb_file_path = "/tmp/temp.pdb"
+    relaxed_pose.dump_pdb(temp_pdb_file_path)
+    # 3. Calculate Interface Metrics
+    interface_metrics = analyze_interface(pose= relaxed_pose, temp_pdb_file_path= temp_pdb_file_path, 
+                                          epi_residues= epi_residues, binder_chain_id= binder_chain_id, target_chain_id= target_chain_id)
+    # 4. Calculate RMSD between relaxed holo and apo structures (only if rmsd_inputs is provided)
+    required_keys = {'pdb_file_path_apo', 'align_mask', 'measure_mask'}
+    if required_keys.issubset(rmsd_inputs.keys()): # Returns True if required_keys are present, even if others exist
+        interface_rmsd, _, _ = run_superimpose_and_calculate_rmsd_apo_holo_pipeline(pdb_file_path_holo = temp_pdb_file_path,
+                                                                                    pdb_file_path_apo = rmsd_inputs['pdb_file_path_apo'],
+                                                                                    align_mask = rmsd_inputs['align_mask'],
+                                                                                    calculate_rmsd_mask = rmsd_inputs['measure_mask'],
+                                                                                    binder_chain_id = binder_chain_id,
+                                                                                )
+        interface_metrics['interface_holo_apo_rmsd'] = interface_rmsd
+    interface_metrics['file_path_holo'] = pdb_file_path
+    interface_metrics['pdb_filename'] = os.path.basename(pdb_file_path)
+    return interface_metrics
+
+
+def run_relaxation_and_physics_scoring_over_folder(pdb_folder_path: str, epi_residues: list, binder_chain_id: str = "A", target_chain_id: str = "B", 
                                        save_relaxed: bool = False, cutoff: float = 4.5):
     """ Runs relaxation and physics scoring on a set of PDB Files containing promising designs from structure-based design workflow """
     # Create initial list of dictionaries to store results
     all_interface_metrics = []
     pdb_file_paths = extract_pdb_designs(pdb_folder_path)
     for pdb_file_path in pdb_file_paths:
-        print(f"Processing PDB file: {pdb_file_path}")
-        relaxed_pose = relax_pdb(pdb_file_path= pdb_file_path, save_relaxed= save_relaxed)
-        interface_metrics = analyze_interface(pose= relaxed_pose, epi_residues= epi_residues, 
-                                              binder_chain_id= binder_chain_id, target_chain_id= target_chain_id)
-        interface_metrics['pdb_file_path'] = pdb_file_path
-        interface_metrics['pdb_file_name'] = os.path.basename(pdb_file_path)
+        interface_metrics = run_relaxation_and_physics_scoring_single_pdb(pdb_file_path= pdb_file_path, epi_residues= epi_residues, 
+                                                                          binder_chain_id= binder_chain_id, target_chain_id= target_chain_id, 
+                                                                          save_relaxed= save_relaxed, cutoff= cutoff)
         all_interface_metrics.append(interface_metrics)
     
     # Convert list of dictionaries to Pandas DataFrame
