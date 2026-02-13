@@ -4,7 +4,7 @@ import biotite.structure as struc
 import biotite.structure.io.pdb as pdb
 import biotite.structure.io.pdbx as pdbx
 
-def extract_atom_array(struc_file_path: str):
+def extract_atom_array(struc_file_path: str, ca_only = False):
     """ Extract atom array from either CIF File or PDB File"""
     if struc_file_path.endswith(".cif"):
         pdbx_file = pdbx.CIFFile.read(struc_file_path)
@@ -14,7 +14,138 @@ def extract_atom_array(struc_file_path: str):
         atom_array = pdb_file.get_structure(model = 1)
     else:
         raise ValueError("File must be either a PDB or CIF file")
+    if ca_only:
+        atom_array = atom_array[atom_array.atom_name == "CA"]
     return atom_array
+
+def extract_sidechain_atom_array(atom_array):
+    """ Extract atom_array subset corresponding to all residues' side chain atoms (atoms attached to CB)
+        For the case of Glycine, since only bound to Hydrogen. Extract its CA as a proxy
+    """
+    backbone_atoms = ['N', 'CA', 'C', 'O']
+    atom_array_side_chains = atom_array[~np.isin(atom_array.atom_name, backbone_atoms) | 
+                                            ((atom_array.res_name == 'GLY') & (atom_array.atom_name == 'CA'))]
+    return atom_array_side_chains
+    
+#------------------------------ Identification of surface and core residues functions --------------------------------------------------------------------
+def compute_sasa(atom_array, per_residue = True) -> np.array:
+    """ Computes solvent accessible surface area (SASA)
+        Biotite computes SASA per atom basis so need to aggregate (np.nansum) for per-residue basis
+        Returns per-residue solvent accessible surface area (SASA) if per_residue = True, else returns per-atom SASA
+    """
+    # 1. Calculate Solvent Accessible Surface Area (computed for all atoms)
+    sasa_atom = struc.sasa(array = atom_array)
+    # 2. Compute Residue-wise Solvent Accessible Surface Area
+    # 2.1 Takes in original atom array, per-atom calculations, and a function to aggregate to per-residue
+    if per_residue:
+        sasa = struc.apply_residue_wise(atom_array, sasa_atom, np.nansum)
+    else:
+        sasa = sasa_atom
+    return sasa
+
+def compute_relative_sasa(atom_array) -> np.array:
+    """ Computes relative solvent accessible surface area (SASA)
+        Biotite computes SASA per atom basis so need to aggregate (np.nansum) for per-residue basis and then normalize by max SASA
+        Returns per-residue relative solvent accessible surface area (SASA)
+    """
+    # Source: Tien, M. Z., et al. (2013). "Maximum allowed solvent accessibilites of residues in proteins". PLoS ONE.
+    # Scale: Theoretical (in square Angstroms)
+    max_sasa = {"ALA": 129.0, "ARG": 274.0, "ASN": 195.0, "ASP": 193.0, "CYS": 167.0, "GLN": 225.0, "GLU": 223.0, 
+                "GLY": 104.0, "HIS": 224.0, "ILE": 197.0, "LEU": 201.0, "LYS": 236.0, "MET": 224.0, "PHE": 240.0, 
+                "PRO": 159.0, "SER": 155.0, "THR": 172.0, "TRP": 285.0, "TYR": 263.0, "VAL": 174.0}
+    
+    # 1. Compute per-residue SASA
+    sasa_residue = compute_sasa(atom_array = atom_array, per_residue = True)
+    # 2.2 Extract chain residues
+    res_indices, residues_3aa = struc.get_residues(atom_array)
+    # 2.3 Conduct Calculation: divide per-residue sasa by max sasa for each residue
+    sasa_relative = []
+    for aa3, per_residue_sasa in zip(residues_3aa, sasa_residue):
+        per_residue_sasa_max = max_sasa[aa3]
+        per_residue_sasa_relative = per_residue_sasa / per_residue_sasa_max
+        sasa_relative.append(per_residue_sasa_relative)
+    
+    return sasa_relative
+
+def identify_surface_core_residues(atom_array, core_threshold: float = 0.25):
+    """ 
+    Using the relative surface area of each residue to identify core and surface residues
+    Surface Residues have a relative surface area > 0.25
+    Core Residues have a relative surface area <= 0.25
+
+    Args:
+        atom_array (np.array): Atom array of the Fab
+        core_threshold (float): Threshold for identifying core residues
+    Returns:
+        surface_indices (np.array): Numpy array of 0-indexed indices of surface residues
+        core_indices (np.array): Numpy array of 0-indexed indices of core residues
+    """
+
+    relative_sasa_per_residue = compute_relative_sasa(atom_array)
+    # 1. Create boolean mask for core and surface residues
+    mask_core = np.array(relative_sasa_per_residue) <= core_threshold
+    mask_surface = ~mask_core
+    # 2. Extract indices of core and surface residues
+    indices_core = np.where(mask_core)[0]
+    indices_surface = np.where(mask_surface)[0]
+    # 3. Save both masks and indices as separate dictionaries
+    mask_dictionary = {'surface': mask_surface, 'core': mask_core}
+    indices_dictionary = {'surface': indices_surface, 'core': indices_core}
+    return mask_dictionary, indices_dictionary
+
+#------------------------------ Aligning Parent Fab (VH-VL) to Apo ScFv Design and Computing CDR & FR RMSD
+def superimpose_align_parent_design(struc_parent_path: str, struc_design_path: str, mask_dictionary: dict, binder_chain_id: str = 'A'):
+    """ Superimposes the design onto the parent structure and calculates the RMSD between the two structures.
+        1st Superimpostion: Aligns the FRs of the parent and design structure using the transformation matrix
+        2nd Superimposition: Aligns the CDRs of the parent and design structure using the transformation matrix
+        Returns: 1st Superimposition RMSD (CDR RMSD) & 2nd Superimposition (FR RMSD) between the two structures
+        Args:
+            struc_parent_path (str): Path to the parent structure
+            struc_design_path (str): Path to the design structure
+            mask_dictionary (dict): Dictionary containing the FR, CDR regions boolean mask for the parent and design structure
+                Structure: {'parent' : {'fr' : fr_mask_parent, 'cdr' : cdr_mask_parent, 'linker' : linker_mask_parent},
+                            'design' : {'fr' : fr_mask_design, 'cdr' : cdr_mask_design, 'linker' : linker_mask_design}}
+            binder_chain_id (str): Chain ID of the binder chain in the design structure
+        Returns:
+            cdr_rmsd (float): RMSD between the CDRs of the parent and design structure (aligned on FR residues)
+            fr_rmsd (float): RMSD between the FRs of the parent and design structure (aligned on CDR residues)
+            Saved as dictionary: {'rmsd_cdr': cdr_rmsd, 'rmsd_fr': fr_rmsd}
+    """
+
+    #--------------------------Extracted atom arrays
+    atom_array_parent = extract_atom_array(struc_parent_path, ca_only = True)
+    atom_array_design = extract_atom_array(struc_design_path, ca_only = True)
+    atom_array_design = atom_array_design[atom_array_design.chain_id == binder_chain_id]
+
+    #--------------Extract Coordinates of FRs and CDRs in both parent and design atom arrays
+    fr_parent_coord = struc.coord(atom_array_parent[mask_dictionary['parent']['fr']])
+    fr_design_coord = struc.coord(atom_array_design[mask_dictionary['design']['fr']])
+    cdr_parent_coord = struc.coord(atom_array_parent[mask_dictionary['parent']['cdr']])
+    cdr_design_coord = struc.coord(atom_array_design[mask_dictionary['design']['cdr']])
+    #-------------Align on Framework Coordinates of respective Parent & Design to get a transformation mask
+    aligned_design_on_parent, align_transformation = struc.superimpose(fixed = fr_parent_coord, mobile = fr_design_coord)
+    #-------------Apply transformation mask on to original atom_array_design to get aligned_atom_array
+    atom_array_design_aligned_fr = align_transformation.apply(atoms = atom_array_design)
+    #-------------Extract CDR Coordinates of the Design
+    cdr_aligned_design_coord = struc.coord(atom_array_design_aligned_fr[mask_dictionary['design']['cdr']])
+    #------------- Compute CDR RMSD of the Parent vs Design Chain in Binder-Target Complex
+    cdr_rmsd = struc.rmsd(reference = cdr_parent_coord, subject = cdr_aligned_design_coord)
+    print(f"After alignment of the design chain from the binder-target complex on to the parent Fab using just the FRs, ....")
+    print(f"Computed CDR RMSD: {cdr_rmsd}")
+
+    #-------------Align on CDR Coordinates of respective Parent & Design to get a transformation mask
+    aligned_design_on_parent, align_transformation = struc.superimpose(fixed = cdr_parent_coord, mobile = cdr_design_coord)
+    #-------------Apply transformation mask on to original atom_array_design to get aligned_atom_array
+    atom_array_design_aligned_cdr = align_transformation.apply(atoms = atom_array_design)
+    #-------------Extract CDR Coordinates of the Design
+    fr_aligned_design_coord = struc.coord(atom_array_design_aligned_cdr[mask_dictionary['design']['fr']])
+    #------------- Compute CDR RMSD of the Parent vs Design Chain in Binder-Target Complex
+    fr_rmsd = struc.rmsd(reference = fr_parent_coord, subject = fr_aligned_design_coord)
+    print(f"After alignment of the design chain from the binder-target complex on to the parent Fab using just the CDRs, ....")
+    print(f"Computed FR RMSD: {fr_rmsd}")
+    fr_cdr_rmsd = {'rmsd_cdr' : cdr_rmsd, 'rmsd_fr' : fr_rmsd}
+    return fr_cdr_rmsd 
+
 #------------------------------ Determine Binding Interface: Paratope, Epitope, Overlap on desired epitope residues --------------------------------------
 def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: list, binder_chain_id: str = "A", 
                                 target_chain_id: str = "B", cutoff: float = 4.5) -> dict:
@@ -75,7 +206,7 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
     if (len(desired_epitope) == 0) or (len(actual_epitope) == 0):
         recall = 0
         precision = 0
-        desired_epitope_coverage = 0
+        f1_score = 0
 
     # --- METRICS ---
     
@@ -86,8 +217,8 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
     # Accounts for off-target hits since division by actual epitope residues rather than desire epitope residues
     precision = len(intersection) / len(actual_epitope)
     
-    # Jaccard: The balanced score (Best single metric). Accounts for both off-target hits and missed desired residues.
-    desired_epitope_coverage = len(intersection) / len(union)
+    # Jaccard: The balanced F1 score (Best single metric). Accounts for both off-target hits and missed desired residues.
+    f1_score = len(intersection) / len(union)
 
     contact_information = {
         "binder_chain": binder_chain_id,
@@ -98,7 +229,9 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
         "epitope_indices": epitope_indices_str,
         "epitope_length": epitope_length,
         "epitope_1aa": epitope_1aa,
-        "desired_epitope_coverage": desired_epitope_coverage
+        "epitope_coverage_recall": recall,
+        "epitope_coverage_precision": precision,
+        "epitope_coverage_f1": f1_score
     }
     return contact_information
 
