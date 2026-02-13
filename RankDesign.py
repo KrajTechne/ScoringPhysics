@@ -11,30 +11,41 @@ class RankDesign():
                                       'ptm_apo' : 0.8,
                                       'plddt': 0.9,
                                       'iplddt': 0.9,
-                                      'desired_epitope_coverage' : 0.8, # Boltz2 Recall 
-                                      'true_desired_epitope_coverage' : 0.25, # Boltz2 Precision
-                                      'desired_epitope_coverage_chai' : 0.4} # Chai F1 score (Future needs to indicate this in metric)
+                                      'epitope_coverage_recall' : 0.8, # Boltz2 Recall 
+                                      'epitope_coverage_precision' : 0.25, # Boltz2 Precision
+                                      'epitope_coverage_f1_chai' : 0.4, # Chai F1 score (Future needs to indicate this in metric)
+                                      'heavy_saltbridge_count' : 0.2,
+                                      'light_saltbridge_count' : 0.2,
+                                      'heavy_hbond_freq' : 0.5,
+                                      'light_hbond_freq' : 0.5} 
         # Dictionary of metrics and respective weights in terms of design criteria importance (smaller value means more important
         self.metrics_weights = {
                                 # Tier 1: Primary Success Metrics (Weight = 1)
                                 "neg_interface_dG": 1,              # Physics is king
                                 "iptm": 1,                          # Model confidence in the interface
-                                "desired_epitope_coverage": 1,      # You want to prioritize hitting the target
-                                "desired_epitope_coverage_chai": 1, # In Blind Validation, should still hit the target
+                                "epitope_coverage_recall": 1,      # You want to prioritize hitting the target
+                                "epitope_coverage_f1_chai": 1, # In Blind Validation, should still hit the target
                                 # Tier 2: Structural Quality (Weight = 2)
                                 # These effectively count for "half" as much as Tier 1
+                                "iptm_chai": 2,                     # Structure Validation by different approach
                                 "interface_sc": 2,                  # Shape complementarity
                                 "neg_interface_dG_SASA_ratio": 2,  # Efficient binding
-                                "neg_interface_holo_apo_rmsd": 2,   # Smaller absolute value means less induced fit
+                                "neg_interface_holo_apo_rmsd": 2,   # Smaller absolute value means less induced fit (Computed only over CDR & aligned on FR)
                                 "ptm_apo": 2,                       # Model confidence in the apo structure
-                                "true_desired_epitope_coverage": 2, # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
+                                "epitope_coverage_precision": 2, # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
+                                #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 2 or 2.5)
+                                "heavy_saltbridge_count" : 2,
+                                "light_saltbridge_count" : 2,
+                                "heavy_hbond_freq" : 2.5,
+                                "light_hbond_freq" : 2.5,
                                 # Tier 3: Nice-to-Haves (Weight = 3 or 4)
+                                "parent_rmsd_cdr": 3,               # Ensure consistency between design and parent CDR regions
                                 "iplddt": 3,                        # Model confidence in the interface
                                 "binding_interface_hbonds": 4,      # Counts are noisy; high count doesn't always mean better
                                 "interface_packstat": 4,
                                 }
         # Columns to flip signs for due to want all metrics to be formatted where higher value = better design
-        self.cols_to_flip = ['interface_dG', 'interface_dG_SASA_ratio', 'interface_holo_apo_rmsd']
+        self.cols_to_flip = ['interface_dG', 'interface_dG_SASA_ratio', 'interface_holo_apo_rmsd', 'parent_rmsd_cdr']
     
     def update_threshold(self, metric:str, threshold:float):
         """ Update threshold for a given metric """
@@ -61,7 +72,8 @@ class RankDesign():
         """ Create negative versions of metrics such that all metrics are higher value is better """
         df_copy = df.copy()
         for col in self.cols_to_flip:
-            df_copy[f"neg_{col}"] = df_copy[col] * -1
+            if col in df_copy.columns:
+                df_copy[f"neg_{col}"] = df_copy[col] * -1
         return df_copy
     
     
@@ -83,11 +95,6 @@ class RankDesign():
         """
         # Check if design_id_col is in df_designs
         assert seq_col in df_designs.columns, f"Sequence column {seq_col} not found in df_designs"
-    
-        # Check if critical metrics are in df_designs
-        critical_metrics = set(self.metric_threshold_dict.keys()) - {'iplddt', 'true_desired_epitope_coverage', 'desired_epitope_coverage_chai'}
-        missing_metrics = critical_metrics.difference(df_designs.columns) # Difference is directional
-        assert critical_metrics.issubset(df_designs.columns), f"Metrics: {missing_metrics} not found in df_designs"
 
         # Initialize the boolean DataFrame with the same index as the input DataFrame. Prevents misalignment when checking Threshold Pass/Fail
         df_bool = pd.DataFrame(index=df_designs.index)
