@@ -156,7 +156,7 @@ def run_relaxation_and_physics_scoring_single_pdb(pdb_file_path: str, epi_residu
                                                                                     binder_chain_id = binder_chain_id,
                                                                                 )
         interface_metrics['interface_holo_apo_rmsd'] = interface_rmsd
-    interface_metrics['file_path_holo'] = pdb_file_path
+    interface_metrics['filepath_holo'] = pdb_file_path
     interface_metrics['pdb_filename'] = os.path.basename(pdb_file_path)
     return interface_metrics
 
