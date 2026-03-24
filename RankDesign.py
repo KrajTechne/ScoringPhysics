@@ -7,22 +7,21 @@ class RankDesign():
     def __init__(self):
         self.metric_threshold_dict = {'interface_sc' : 0.55,
                                       'neg_interface_holo_apo_rmsd' : -1, # Negative because flipping all columns so higher is better
-                                      'iptm' : 0.8,
-                                      'ptm_apo' : 0.8,
+                                      'parent_rmsd_cdr' : -1,
+                                      'iptm' : 0.80,
+                                      'ptm_apo' : 0.80,
                                       'plddt': 0.9,
                                       'iplddt': 0.9,
                                       'epitope_coverage_recall' : 0.8, # Boltz2 Recall 
                                       'epitope_coverage_precision' : 0.25, # Boltz2 Precision
                                       'epitope_coverage_f1_chai' : 0.4, # Chai F1 score (Future needs to indicate this in metric)
-                                      'heavy_saltbridge_count' : 0.2,
-                                      'light_saltbridge_count' : 0.2,
                                       'heavy_hbond_freq' : 0.5,
                                       'light_hbond_freq' : 0.5} 
         # Dictionary of metrics and respective weights in terms of design criteria importance (smaller value means more important
         self.metrics_weights = {
                                 # Tier 1: Primary Success Metrics (Weight = 1)
                                 "neg_interface_dG": 1,              # Physics is king
-                                "iptm": 1,                          # Model confidence in the interface
+                                "iptm": 1,                          # Model confidence in the interface (OG: 1)
                                 "epitope_coverage_recall": 1,      # You want to prioritize hitting the target
                                 "epitope_coverage_f1_chai": 1, # In Blind Validation, should still hit the target
                                 # Tier 2: Structural Quality (Weight = 2)
@@ -33,16 +32,17 @@ class RankDesign():
                                 "neg_interface_holo_apo_rmsd": 2,   # Smaller absolute value means less induced fit (Computed only over CDR & aligned on FR)
                                 "ptm_apo": 2,                       # Model confidence in the apo structure
                                 "epitope_coverage_precision": 2, # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
-                                #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 2 or 2.5)
-                                "heavy_saltbridge_count" : 2,
-                                "light_saltbridge_count" : 2,
-                                "heavy_hbond_freq" : 2.5,
-                                "light_hbond_freq" : 2.5,
                                 # Tier 3: Nice-to-Haves (Weight = 3 or 4)
                                 "parent_rmsd_cdr": 3,               # Ensure consistency between design and parent CDR regions
                                 "iplddt": 3,                        # Model confidence in the interface
                                 "binding_interface_hbonds": 4,      # Counts are noisy; high count doesn't always mean better
                                 "interface_packstat": 4,
+                                 #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 4.5 or 5)
+                                 "heavy_hbond_freq" : 4.5,
+                                "light_hbond_freq" : 4.5,
+                                "heavy_saltbridge_count" : 5,
+                                "light_saltbridge_count" : 5,
+                                
                                 }
         # Columns to flip signs for due to want all metrics to be formatted where higher value = better design
         self.cols_to_flip = ['interface_dG', 'interface_dG_SASA_ratio', 'interface_holo_apo_rmsd', 'parent_rmsd_cdr']
@@ -51,7 +51,7 @@ class RankDesign():
         """ Update threshold for a given metric """
         self.metric_threshold_dict[metric] = threshold
         
-    def update_weights(self, metric:str, weight:int):
+    def update_weights(self, metric:str, weight:float):
         """ Update weight for a given metric """
         self.metrics_weights[metric] = weight
     
