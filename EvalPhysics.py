@@ -1,4 +1,5 @@
 import os
+import uuid 
 import biotite
 import pandas as pd
 import numpy as np
@@ -10,14 +11,15 @@ from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.core.kinematics import MoveMap
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
-from StrucTools import run_superimpose_and_calculate_rmsd_apo_holo_pipeline, determine_binding_interface
+from StrucTools import *
+from Scfv import Scfv
 
 # Initialize PyRosetta
 # We use the same flags to ensure the scoring physics matches the original pipeline
 dalphaball_path = os.path.join(os.path.abspath("."), "DAlphaBall.gcc")
 pr.init(
     f"-ignore_unrecognized_res -ignore_zero_occupancy -mute all "
-    f"-holes:dalphaball {dalphaball_path} -corrections::beta_nov16 true -relax:default_repeats 2"
+    f"-holes:dalphaball {dalphaball_path} -corrections::beta_nov16 true -relax:default_repeats 5"
 )
 
 def extract_pdb_designs(pdb_folder_path: str) -> list:
@@ -88,7 +90,55 @@ def relax_pdb(pdb_file_path: str, save_relaxed: bool = True) -> pr.Pose:
         
     return pose
 
-def analyze_interface(pose: pr.Pose, epi_residues: list,temp_pdb_file_path: str = "/tmp/temp.pdb", binder_chain_id: str = "A", target_chain_id: str = "B",
+def compute_surface_hydrophobicity(pdb_file_path: str, binder_chain_id: str = "A", target_chain_id: str = "B", linker: bool = True):
+    
+    """ Compute the surface hydrophobicity of a PyRosetta Relaxed pose using Biotite SASA calculator"""
+    # Hydrophobic amino acid set for scoring hydrophobicity
+    aa_hydrophob = set("ACFILMVWY")
+    chain_id_to_index = {'A': 0, 'B': 1}
+    
+    atom_array_binder_target = extract_atom_array(struc_file_path = pdb_file_path)
+    
+    # Extract seq and atom_array of binder
+    atom_array_binder = atom_array_binder_target[atom_array_binder_target.chain_id == binder_chain_id]
+    seqs, chain_start = struc.to_sequence(atom_array_binder)
+    seq_binder = str(seqs[chain_id_to_index[binder_chain_id]])
+    
+    # Extract mask for the surface and total number of surface residues
+    mask_dictionary, indices_dictionary = identify_surface_core_residues(atom_array_binder)
+    mask_surface = mask_dictionary['surface']
+    
+    # Workflow for if the input is an scfv with linker and want surface hydrophobocity of non-linker regions or variable regions
+    if linker:
+        # Annotate scfv using Scfv class and extract residue wise linker mask
+        scfv_id = "scfv_1"
+        scfv_obj = Scfv(verbose = False)
+        scfv_obj.update_seqs(seq_id = scfv_id, seq = seq_binder)
+        annotated_scfv = scfv_obj.annotate_seqs()[scfv_id]
+        mask_fr, mask_cdr, mask_linker = scfv_obj.generate_scfv_regions_mask(scfv_id = scfv_id)
+
+        # Quick Fix: Sometimes annotation scheme messes up and linker is incorrectly defined
+        if ((len(mask_linker) != len(seq_binder)) and (annotated_scfv['orientation'] == "VH-VL")):
+            heavy_seq_len = len(annotated_scfv['heavy']['seq'])
+            mask_linker = np.zeros(len(seq_binder), dtype = bool)
+            mask_linker[heavy_seq_len: heavy_seq_len + 20] = True # Hard-coded linker length as 20. Need to find better solution *****
+        
+        # Invert linker mask to get the variable regions (regions connected by linker)
+        mask_var_regions = ~mask_linker
+
+        # Redefine surface-mask to be the intersection of the surface mask and the variable regions 
+        mask_surface = mask_surface & mask_var_regions
+        seq_binder = "".join(seq_binder[index] for index, val in enumerate(mask_var_regions) if val)
+    
+    # Identify number of surface residues & hydrophobics on surface based on surface mask
+    num_binder_surface_residues = sum(mask_surface)
+    num_binder_surface_hydrophobics = sum([1 for index, aa in enumerate(seq_binder) if ((aa in aa_hydrophob) & (mask_surface[index]))])
+
+    # Compute surface hydrophobicity
+    surface_hydrophobicity = num_binder_surface_hydrophobics / num_binder_surface_residues if num_binder_surface_residues > 0 else 0.0
+    return surface_hydrophobicity
+
+def analyze_interface(pose: pr.Pose, epi_residues: list, temp_pdb_file_path: str, binder_chain_id: str = "A", target_chain_id: str = "B",
                       cutoff: float = 4.5) -> dict:
     """ Analyzes the interface of a PyRosetta Relaxed pose using PyRosetta's InterfaceAnalyzerMover """
 
@@ -120,6 +170,8 @@ def analyze_interface(pose: pr.Pose, epi_residues: list,temp_pdb_file_path: str 
     interface_packstat = interface_analyzer.get_interface_packstat()
     interface_dG_SASA_ratio = interface_score.dG_dSASA_ratio * 100
 
+    # Calculate surface hydrophobicity
+    surface_hydrophobicity = compute_surface_hydrophobicity(pdb_file_path = temp_pdb_file_path, binder_chain_id = binder_chain_id, target_chain_id = target_chain_id)
     # Save output in a dictionary
     interface_metrics = {
         "interface_sc": interface_sc,
@@ -127,7 +179,8 @@ def analyze_interface(pose: pr.Pose, epi_residues: list,temp_pdb_file_path: str 
         "interface_dG": interface_dG,
         "interface_dSASA": interface_dSASA,
         "interface_packstat": interface_packstat,
-        "interface_dG_SASA_ratio": interface_dG_SASA_ratio
+        "interface_dG_SASA_ratio": interface_dG_SASA_ratio,
+        "surface_hydrophobicity" : surface_hydrophobicity
     }
     # Combine both contact information and interface metrics dictionaries into one
     full_interface_metrics = {**contact_information, **interface_metrics}
@@ -137,27 +190,44 @@ def run_relaxation_and_physics_scoring_single_pdb(pdb_file_path: str, epi_residu
                                                   binder_chain_id: str = "A", target_chain_id: str = "B", 
                                                   save_relaxed: bool = False, cutoff: float = 4.5):
     """ Runs relaxation and physics scoring on a single PDB File containing a promising design from structure-based design workflow """
-    print(f"Processing PDB file: {pdb_file_path}")
+    #print(f"Processing PDB file: {pdb_file_path}")
     # 1. Relax PDB File
     relaxed_pose = relax_pdb(pdb_file_path= pdb_file_path, save_relaxed= save_relaxed) 
     # 2. Convert relaxed pose into PDB file for extracting contact information & calculating RMSD between relaxed holo and apo structures
-    temp_pdb_file_path = "/tmp/temp.pdb"
-    relaxed_pose.dump_pdb(temp_pdb_file_path)
-    # 3. Calculate Interface Metrics
-    interface_metrics = analyze_interface(pose= relaxed_pose, temp_pdb_file_path= temp_pdb_file_path, 
-                                          epi_residues= epi_residues, binder_chain_id= binder_chain_id, target_chain_id= target_chain_id)
-    # 4. Calculate RMSD between relaxed holo and apo structures (only if rmsd_inputs is provided)
-    required_keys = {'pdb_file_path_apo', 'align_mask', 'measure_mask'}
-    if required_keys.issubset(rmsd_inputs.keys()): # Returns True if required_keys are present, even if others exist
-        interface_rmsd, _, _ = run_superimpose_and_calculate_rmsd_apo_holo_pipeline(pdb_file_path_holo = temp_pdb_file_path,
-                                                                                    pdb_file_path_apo = rmsd_inputs['pdb_file_path_apo'],
-                                                                                    align_mask = rmsd_inputs['align_mask'],
-                                                                                    calculate_rmsd_mask = rmsd_inputs['measure_mask'],
-                                                                                    binder_chain_id = binder_chain_id,
+    unique_id = uuid.uuid4().hex
+    temp_pdb_file_path = f"/tmp/temp_{unique_id}.pdb"
+    try:
+        relaxed_pose.dump_pdb(temp_pdb_file_path)
+        # 3. Calculate Interface Metrics
+        interface_metrics = analyze_interface(pose= relaxed_pose, temp_pdb_file_path= temp_pdb_file_path, 
+                                              epi_residues= epi_residues, binder_chain_id= binder_chain_id, target_chain_id= target_chain_id)
+        # 4. Calculate RMSD between relaxed holo and apo structures (only if rmsd_inputs is provided)
+        required_keys = {'filepath_apo', 'align_mask', 'measure_mask'}
+        if required_keys.issubset(rmsd_inputs.keys()): # Returns True if required_keys are present, even if others exist
+            interface_rmsd, _, _ = run_superimpose_and_calculate_rmsd_apo_holo_pipeline(pdb_file_path_holo = temp_pdb_file_path,
+                                                                                        pdb_file_path_apo = rmsd_inputs['filepath_apo'],
+                                                                                        align_mask = rmsd_inputs['align_mask'],
+                                                                                        calculate_rmsd_mask = rmsd_inputs['measure_mask'],
+                                                                                        binder_chain_id = binder_chain_id,
                                                                                 )
-        interface_metrics['interface_holo_apo_rmsd'] = interface_rmsd
-    interface_metrics['filepath_holo'] = pdb_file_path
-    interface_metrics['pdb_filename'] = os.path.basename(pdb_file_path)
+            interface_metrics['interface_holo_apo_rmsd'] = interface_rmsd
+        # 5. Calculate RMSD between relaxed holo and parent fab structure (only if rmsd inputs is provided)
+        required_parent_keys = {'struc_parent_path', 'mask_region'}
+        if required_parent_keys.issubset(rmsd_inputs.keys()): # Returns True if required_keys are present, even if others exist
+            parent_design_rmsd = superimpose_align_parent_design(struc_parent_path = rmsd_inputs['struc_parent_path'],
+                                                                 struc_design_path = temp_pdb_file_path,
+                                                                 mask_dictionary = rmsd_inputs['mask_region'])
+            interface_metrics['rmsd_parent_cdr'] = parent_design_rmsd['rmsd_cdr']
+            interface_metrics['rmsd_parent_fr'] = parent_design_rmsd['rmsd_fr']
+        
+        # 6. Save the metrics in a dictionary and return it
+        interface_metrics['filepath_holo'] = pdb_file_path
+        interface_metrics['pdb_filename'] = os.path.basename(pdb_file_path)
+    
+    finally:
+        # --- FIXED: Always delete the temporary file, even if the code above crashes! ---
+        if os.path.exists(temp_pdb_file_path):
+            os.remove(temp_pdb_file_path)
     return interface_metrics
 
 
