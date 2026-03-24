@@ -1,3 +1,6 @@
+import torch
+import gemmi
+import py2Dmol
 import numpy as np
 import biotite.sequence as seq
 import biotite.structure as struc
@@ -128,21 +131,15 @@ def superimpose_align_parent_design(struc_parent_path: str, struc_design_path: s
     atom_array_design_aligned_fr = align_transformation.apply(atoms = atom_array_design)
     #-------------Extract CDR Coordinates of the Design
     cdr_aligned_design_coord = struc.coord(atom_array_design_aligned_fr[mask_dictionary['design']['cdr']])
+    fr_aligned_design_coord = struc.coord(atom_array_design_aligned_fr[mask_dictionary['design']['fr']])
     #------------- Compute CDR RMSD of the Parent vs Design Chain in Binder-Target Complex
     cdr_rmsd = struc.rmsd(reference = cdr_parent_coord, subject = cdr_aligned_design_coord)
+    #------------- Compute FR RMSD of the Parent vs Design Chain in Binder-Target Complex
+    fr_rmsd = struc.rmsd(reference = fr_parent_coord, subject = fr_aligned_design_coord)
     print(f"After alignment of the design chain from the binder-target complex on to the parent Fab using just the FRs, ....")
     print(f"Computed CDR RMSD: {cdr_rmsd}")
-
-    #-------------Align on CDR Coordinates of respective Parent & Design to get a transformation mask
-    aligned_design_on_parent, align_transformation = struc.superimpose(fixed = cdr_parent_coord, mobile = cdr_design_coord)
-    #-------------Apply transformation mask on to original atom_array_design to get aligned_atom_array
-    atom_array_design_aligned_cdr = align_transformation.apply(atoms = atom_array_design)
-    #-------------Extract CDR Coordinates of the Design
-    fr_aligned_design_coord = struc.coord(atom_array_design_aligned_cdr[mask_dictionary['design']['fr']])
-    #------------- Compute CDR RMSD of the Parent vs Design Chain in Binder-Target Complex
-    fr_rmsd = struc.rmsd(reference = fr_parent_coord, subject = fr_aligned_design_coord)
-    print(f"After alignment of the design chain from the binder-target complex on to the parent Fab using just the CDRs, ....")
     print(f"Computed FR RMSD: {fr_rmsd}")
+
     fr_cdr_rmsd = {'rmsd_cdr' : cdr_rmsd, 'rmsd_fr' : fr_rmsd}
     return fr_cdr_rmsd 
 
@@ -202,23 +199,22 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
     # 2. Union: The Total Footprint (Target + Spillover)
     union = actual_epitope.union(desired_epitope)
     
+    # --- Compute Metrics ---
     # Avoid division by zero
     if (len(desired_epitope) == 0) or (len(actual_epitope) == 0):
         recall = 0
         precision = 0
         f1_score = 0
-
-    # --- METRICS ---
+    else:
+        # Recall: What percentage of the desired epitope residues were hit within pool of desired epitope residues?
+        recall = len(intersection) / len(desired_epitope)
     
-    # Recall: What percentage of the desired epitope residues were hit within pool of desired epitope residues?
-    recall = len(intersection) / len(desired_epitope)
+        # Precision: What percentage of the actual epitope residues were hits within pool of desired epitope residues?
+        # Accounts for off-target hits since division by actual epitope residues rather than desire epitope residues
+        precision = len(intersection) / len(actual_epitope)
     
-    # Precision: What percentage of the actual epitope residues were hits within pool of desired epitope residues?
-    # Accounts for off-target hits since division by actual epitope residues rather than desire epitope residues
-    precision = len(intersection) / len(actual_epitope)
-    
-    # Jaccard: The balanced F1 score (Best single metric). Accounts for both off-target hits and missed desired residues.
-    f1_score = len(intersection) / len(union)
+        # Jaccard: The balanced F1 score (Best single metric). Accounts for both off-target hits and missed desired residues.
+        f1_score = len(intersection) / len(union)
 
     contact_information = {
         "binder_chain": binder_chain_id,
@@ -282,3 +278,117 @@ def run_superimpose_and_calculate_rmsd_apo_holo_pipeline(pdb_file_path_holo: str
                                                                                                         calculate_rmsd_mask= calculate_rmsd_mask,
                                                                                                         ca_only = True)
     return rmsd, aligned_alpha_carbons_binder, align_transformation
+
+#----------------------------------------- Predicted Structure Metrics----------------------------------------------------------
+def calculate_ipsae_complex(pae_matrix, len_binder: int, pae_cutoff: int = 15, verbose = True): 
+    """
+        Calculate the ipsae score for a given pae matrix
+        Assumption: 
+            - PAE matrix is square matrix of shape (L, L) where L = Length of binder + target
+            - PAE matrix derived with binder being first chain and target being second chain
+        Args:
+            pae_matrix (torch.tensor): PAE matrix of shape (L, L) where L = Length of binder + target
+            len_binder (int): Length of binder
+            pae_cutoff (int): PAE cutoff to use for ipsae calculation (Recommended Values: 10 or 15)
+        Returns:
+            ipsae_score (float): ipsae score for the given binder-target pae matrix
+        
+        Works for Chai & Boltz2 (load from pae_jobname.npz with key: "pae") Protein Structure Prediction
+        Need to know order of sequences inserted into pae matrix (i.e Binder (1) -> Target (2) or Target (1) -> Binder (2)
+        Only Functional for Binder (1) -> Target (2)
+    
+    """
+    pae_numpy = pae_matrix if isinstance(pae_matrix, np.ndarray) else pae_matrix.detach().cpu().numpy()
+    
+    # Verifications: PAE matrix is a 2D Square Matrix
+    # Check if pae_matrix is a 2D matrix:
+    if len(pae_numpy.shape) != 2:
+        raise ValueError(f"pae_matrix must be a 2-D matrix. Instead received a matrix of shape: {pae_numpy.shape}")
+    # Check if pae_matrix is square matrix:
+    if pae_numpy.shape[0] != pae_numpy.shape[1]:
+        raise ValueError(f"pae_matrix must be a square matrix. Instead received a matrix of shape: {pae_numpy.shape}")
+    
+    len_target = pae_numpy.shape[0] - len_binder
+    pae_indices = {"A": list(range(len_binder)), "B": list(range(len_binder, len_binder + len_target))}
+
+    def calculate_d0(num_residues_pass_pae: int):
+        """ Calculate d0 for a given number of residues passing PAE cutoff """
+        if num_residues_pass_pae < 27:
+            d0 = 1
+        elif num_residues_pass_pae >= 27:
+            d0 = (1.24 * ((num_residues_pass_pae - 15) ** (1 / 3))) - 1.8
+        return d0
+
+    def calculate_ipsae(chain_aligned: str, chain_measured: str):
+        """ Calculate ipsae when aligned on chain_aligned and measured on chain_measured """
+        chain_aligned_indices = pae_indices[chain_aligned]
+        chain_measured_indices = pae_indices[chain_measured]
+        extracted_indices = np.ix_(chain_aligned_indices, chain_measured_indices)
+        pae_subset = pae_numpy[extracted_indices]
+        pae_pass_mask = pae_subset < pae_cutoff
+        n0_res_vals = np.sum(pae_pass_mask, axis=1)
+        # If chains are not predicted to interact when aligning on the aligned chain, return ipSAE of 0
+        if sum(n0_res_vals) == 0:
+            return 0.0
+        d0_vals = np.array([calculate_d0(n0) for n0 in n0_res_vals])
+        d0_vals = d0_vals.reshape((len(d0_vals), 1))
+        pae_subset[~pae_pass_mask] = -1000
+        pae_mask = np.ma.masked_values(pae_subset, -1000)
+        aligned_residues_ipsae = np.mean((1 / (1 + (pae_mask / d0_vals) ** 2)), axis=1)
+        residue_aligned_highest_ipsae = np.max(aligned_residues_ipsae)
+        return residue_aligned_highest_ipsae
+
+    ipsae_a_b = calculate_ipsae(chain_aligned="A", chain_measured="B")
+    ipsae_b_a = calculate_ipsae(chain_aligned="B", chain_measured="A")
+    ipsae_min = min(ipsae_a_b, ipsae_b_a)
+    ipsae_max = max(ipsae_a_b, ipsae_b_a)
+    if verbose:
+        print("ipsae_a_b: ", ipsae_a_b)
+        print("ipsae_b_a: ", ipsae_b_a)
+    return ipsae_min, ipsae_max
+
+#--------------------------------------------------------------------------- Visualize Structures-------------------------------------
+def visualize_structure(structure_path: str):
+    """
+    Args:
+        - structure_path (str): Path to the structure to be visualized
+    Returns:
+        - None
+     """
+    viewer = py2Dmol.view()
+    viewer.add_pdb(structure_path)
+    viewer.show()
+    
+#------------------------------------------------------------------------- Convert PDB Files to CIF Files-------------------------------
+def convert_pdb_to_cif(input_pdb_path):
+    """Adapts the logic from Boltz's parse_pdb to convert a PDB file to mmCIF."""
+        
+    print(f"Reading PDB: {input_pdb_path}")
+    output_cif_path = input_pdb_path.replace('.pdb', '.cif')
+        
+    # 1. Read the structure using Gemmi
+    structure = gemmi.read_structure(input_pdb_path)
+    structure.setup_entities()
+        
+    # 2. Apply the subchain renaming logic (Copied from Boltz source)
+    # This ensures chains are correctly named for mmCIF format (e.g., handling multiple segments)
+    subchain_counts, subchain_renaming = {}, {}
+    for chain in structure[0]:
+        subchain_counts[chain.name] = 0
+        for res in chain:
+            if res.subchain not in subchain_renaming:
+                subchain_renaming[res.subchain] = chain.name + str(subchain_counts[chain.name] + 1)
+                subchain_renaming[res.subchain] = str(subchain_counts[chain.name] + 1) # Simplified renaming
+                subchain_counts[chain.name] += 1
+            res.subchain = subchain_renaming[res.subchain]
+            
+    # Update entities with new subchain names
+    for entity in structure.entities:
+        entity.subchains = [subchain_renaming.get(subchain, subchain) for subchain in entity.subchains]
+
+    # 3. Create mmCIF document and write to file
+    doc = structure.make_mmcif_document()
+    doc.write_file(output_cif_path)
+    
+    print(f"✅ Converted to CIF: {output_cif_path}")
+    return output_cif_path
