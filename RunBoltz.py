@@ -65,7 +65,7 @@ def create_boltz_yaml(design_name: str, seq_list: list, msa_options: list, templ
         documents = yaml.dump(yaml_data, file)
     return temp_save_dir, yaml_save_path
 
-def run_boltz_prediction(design_name: str, temp_save_dir: str, yaml_save_path: str, num_models = 5,
+def run_boltz_prediction(design_name: str, temp_save_dir: str, yaml_save_path: str, num_models = 5, kernels = True,
                          volume_save_path: str = "/Volumes/sandbox/denovotrial/structure_prediction_boltz2"):
     """ 
     Run Boltz2 to generate structures, save them to temporary directory and then move to volume
@@ -85,6 +85,10 @@ def run_boltz_prediction(design_name: str, temp_save_dir: str, yaml_save_path: s
         "--use_msa_server",
         "--use_potentials"
     ]
+
+    # Only required when running/using an A100 which for some reason uses an older Nvidia Device, so doesn't support latest kernels
+    if kernels != True:
+        command.append("--no_kernels")
 
     # Run the command
     print("Running Boltz prediction...")
@@ -142,7 +146,7 @@ def analyze_structure(volume_save_path: str, design_name: str, model_id: int, le
     return metrics
 
 def boltz_predict_analyze(design_name: str, volume_save_path: str, seq_list: list, msa_options: list = [],
-                          template_paths: list = [], entity_type: list = [], desired_epitope_residues: list = [], num_models: int = 5):
+                          template_paths: list = [], entity_type: list = [], desired_epitope_residues: list = [], num_models: int = 5, kernels: bool = True):
     """
     Args:
             - design_name (str): Unique ID indicating what protein or set of proteins are being predicted structures
@@ -160,7 +164,7 @@ def boltz_predict_analyze(design_name: str, volume_save_path: str, seq_list: lis
     temp_save_dir, yaml_save_path = create_boltz_yaml(design_name=design_name, seq_list=seq_list, msa_options=msa_options,
                                                          template_paths=template_paths, entity_type=entity_type)
     run_boltz_prediction(design_name=design_name, yaml_save_path=yaml_save_path, temp_save_dir=temp_save_dir,
-                         num_models = num_models, volume_save_path=volume_save_path)
+                         num_models = num_models, volume_save_path=volume_save_path, kernels=kernels)
     
     # For each of the "num_models" predicted, analyze the structure
     metrics_design = []
