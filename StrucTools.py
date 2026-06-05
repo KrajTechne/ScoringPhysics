@@ -29,6 +29,78 @@ def extract_sidechain_atom_array(atom_array):
     atom_array_side_chains = atom_array[~np.isin(atom_array.atom_name, backbone_atoms) | 
                                             ((atom_array.res_name == 'GLY') & (atom_array.atom_name == 'CA'))]
     return atom_array_side_chains
+
+def clean_structure(struc_file_path):
+    """
+    Function to clean PDB/CIF file for given struc_file_path by standardizing chain IDs (A to Z) and res IDs (1 to # of residues).
+    If Ligands are present, they are appended to the end of the structure
+    1. Check if a ligand exists in atom_array_complex
+    2. Extract seq, and chain starts for only protein chains
+    3. If ligand is present in the structure, set its chain ID to last letter after protein chains
+    4. Create dictionary of chain id to seq and seq len for given chain (only for protein)
+    5. Clean residue numbering for each protein chain in the structure & standardize chain ID naming of A to len(protein_chains)
+    6. Final PDB/CIF will have protein chains in front with ligand chains at the end
+    
+    Returns:
+    1. atom_array_complex: cleaned version of path_structure
+    """
+    atom_array_complex = extract_atom_array(struc_file_path)
+    
+    # Check if a ligand exists in atom_array_complex
+    atom_array_complex_protein = atom_array_complex[struc.filter_amino_acids(atom_array_complex)]
+    if len(atom_array_complex_protein) == len(atom_array_complex):
+        print("No ligand in the structure")
+        ligand_present = False
+    else:
+        print("Ligand exists in the structure")
+        ligand_present = True
+    
+    # Extract seq, and chain starts for only protein chains
+    seqs, chain_starts = struc.to_sequence(atom_array_complex_protein)
+
+    # If ligand is present in the structure, set its chain ID to last letter after protein chains
+    # Possible Multiple Ligands exist in the structure so need to be able to handle that
+    if ligand_present:
+        # 1. Extract current ligand chains
+        atom_array_ligand = atom_array_complex[~struc.filter_amino_acids(atom_array_complex)]
+        curr_ligand_chains = np.unique(atom_array_ligand.chain_id)
+        # 2. Iterate over current ligand chains, slice original atom_array_complex's chain ID and set chain ID to new_chain_id
+        for index, curr_ligand_chain_id in enumerate(curr_ligand_chains):
+            new_chain_id_ligand = chr(ord('A') + len(chain_starts) + index)
+            boolean_slice = atom_array_complex.chain_id == curr_ligand_chain_id
+            atom_array_complex.chain_id[boolean_slice] = new_chain_id_ligand
+    
+    # Create dictionary of chain id to seq and seq len for given chain (only for protein)
+    dict_chain_seqs = {}
+    for index, seq in enumerate(seqs):
+        chain_id = chr(ord('A') + index)
+        seq = str(seq)
+        seq_len = len(seq)
+        dict_chain_seqs[chain_id] = {
+            'seq': seq,
+            'seq_len': seq_len
+        }
+    
+    # Clean residue numbering for each protein chain in the structure & standardize chain ID naming of A to len(protein_chains)
+    # Final PDB will have protein chains in front with ligand at the end
+    for index, chain_start_atom_index in enumerate(chain_starts):
+
+        # Standardize Chain ID Naming from A to len(protein_chains)
+        new_chain_id = chr(ord('A') + index)
+        old_chain_id = atom_array_complex[chain_start_atom_index].chain_id
+        boolean_slice_chain = atom_array_complex.chain_id == old_chain_id
+        atom_array_complex.chain_id[boolean_slice_chain] = new_chain_id
+        chain_start_res_id = atom_array_complex[chain_start_atom_index].res_id
+        
+        # Chain Residue ID has abnormal residue numbering since does not start from 1
+        if chain_start_res_id != 1:
+            seq_len = dict_chain_seqs[new_chain_id]['seq_len']
+            new_res_id_range = np.arange(1, seq_len + 1)
+            atom_wise_res_id_range = struc.spread_residue_wise(atom_array_complex[atom_array_complex.chain_id == new_chain_id], new_res_id_range)
+            boolean_slice_chain = atom_array_complex.chain_id == new_chain_id
+            atom_array_complex.res_id[boolean_slice_chain] = atom_wise_res_id_range
+
+    return atom_array_complex
     
 #------------------------------ Identification of surface and core residues functions --------------------------------------------------------------------
 def compute_sasa(atom_array, per_residue = True) -> np.array:
@@ -184,7 +256,8 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
 
     # Extract Paratope & Epitope 1-letter AA Strings
     paratope_1aa = "".join([obj_protein_seq.convert_letter_3to1(para_3aa) for para_3aa in paratope_3aa])
-    epitope_1aa = "".join([obj_protein_seq.convert_letter_3to1(epi_3aa) for epi_3aa in epitope_3aa])
+    # X = Unknown Letter for LIG
+    epitope_1aa = "".join([obj_protein_seq.convert_letter_3to1(epi_3aa) if "LIG" not in epi_3aa else "X" for epi_3aa in epitope_3aa])
 
     # Count # of Residues
     paratope_length, epitope_length = len(paratope_indices), len(epitope_indices)
