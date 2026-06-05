@@ -2,13 +2,16 @@ import pandas as pd
 import numpy as np
 import Levenshtein
 import heapq
+from typing import Optional
 pd.options.mode.copy_on_write = True
 class RankDesign():
     def __init__(self):
         self.metric_threshold_dict = {'interface_sc' : 0.55,
                                       'neg_interface_holo_apo_rmsd' : -1, # Negative because flipping all columns so higher is better
+                                      'surface_hydrophobicity' : 0.35,
                                       'parent_rmsd_cdr' : -1,
                                       'iptm' : 0.80,
+                                      'ipsae_min' : 0.61,
                                       'ptm_apo' : 0.80,
                                       'plddt': 0.9,
                                       'iplddt': 0.9,
@@ -19,26 +22,27 @@ class RankDesign():
                                       'light_hbond_freq' : 0.5} 
         # Dictionary of metrics and respective weights in terms of design criteria importance (smaller value means more important
         self.metrics_weights = {
-                                # Tier 1: Primary Success Metrics (Weight = 1)
+                                # Tier 1: Primary Success Metrics (Weight = 1) -----------------------------------------------------------------------------
                                 "neg_interface_dG": 1,              # Physics is king
                                 "iptm": 1,                          # Model confidence in the interface (OG: 1)
-                                "epitope_coverage_recall": 1,      # You want to prioritize hitting the target
-                                "epitope_coverage_f1_chai": 1, # In Blind Validation, should still hit the target
-                                # Tier 2: Structural Quality (Weight = 2)
+                                "epitope_coverage_recall": 1,       # You want to prioritize hitting the target
+                                "epitope_coverage_f1_chai": 1,      # In Blind Validation, should still hit the target
+                                # Tier 2: Structural Quality (Weight = 2) ----------------------------------------------------------------------------------
                                 # These effectively count for "half" as much as Tier 1
                                 "iptm_chai": 2,                     # Structure Validation by different approach
                                 "interface_sc": 2,                  # Shape complementarity
-                                "neg_interface_dG_SASA_ratio": 2,  # Efficient binding
+                                "neg_interface_dG_SASA_ratio": 2,   # Efficient binding
                                 "neg_interface_holo_apo_rmsd": 2,   # Smaller absolute value means less induced fit (Computed only over CDR & aligned on FR)
                                 "ptm_apo": 2,                       # Model confidence in the apo structure
-                                "epitope_coverage_precision": 2, # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
-                                # Tier 3: Nice-to-Haves (Weight = 3 or 4)
+                                "epitope_coverage_precision": 2,    # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
+                                "surface_hydrophobicity": 2,        # Want to minimize hydrophobicity on the surface otherwise will aggregate in the solvent
+                                # Tier 3: Nice-to-Haves (Weight = 3 or 4) ----------------------------------------------------------------------------------
                                 "parent_rmsd_cdr": 3,               # Ensure consistency between design and parent CDR regions
                                 "iplddt": 3,                        # Model confidence in the interface
                                 "binding_interface_hbonds": 4,      # Counts are noisy; high count doesn't always mean better
                                 "interface_packstat": 4,
-                                 #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 4.5 or 5)
-                                 "heavy_hbond_freq" : 4.5,
+                                 #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 4.5 or 5)-------------
+                                "heavy_hbond_freq" : 4.5,
                                 "light_hbond_freq" : 4.5,
                                 "heavy_saltbridge_count" : 5,
                                 "light_saltbridge_count" : 5,
@@ -51,11 +55,15 @@ class RankDesign():
         """ Update threshold for a given metric """
         self.metric_threshold_dict[metric] = threshold
         
-    def update_weights(self, metric:str, weight:float):
+    def update_weight(self, metric:str, weight:float):
         """ Update weight for a given metric """
         self.metrics_weights[metric] = weight
     
-    def create_designed_seq_col(self, df_designs:pd.DataFrame, design_mask: np.ndarray, seq_col:str = 'sequence'):
+    def update_cols_to_flip(self, metric: str):
+        """ Update columns to flip signs for """
+        self.cols_to_flip.append(metric)
+    
+    def create_designed_seq_col(self, df_designs:pd.DataFrame, design_mask: Optional[np.ndarray] = None, seq_col:str = 'sequence'):
         """ 
             Create a column in df_designs with the "sequence_designed" as the column name
             "sequence_designed" refers to the sequence designed by the model. 
@@ -63,8 +71,12 @@ class RankDesign():
             Column is used to define the actual sequence as input for seq similarity calculations between designs
         """
         df_designs_copy = df_designs.copy()
-        df_designs_copy['sequence_designed'] = df_designs_copy[seq_col].apply(lambda x: "".join([aa for i, aa in enumerate(x) 
-                                                                                                 if design_mask[i]]))
+        if "sequence_designed" not in df_designs_copy.columns:
+            if design_mask is None:
+                raise ValueError("Design mask must be provided if 'sequence_designed' column is not present in df_designs")
+            print("Sequence designed column not present in df_designs, creating column now")
+            print("Underlying Assumption is the provided design_mask is viable for all designed seqs in df_designs")
+            df_designs_copy['sequence_designed'] = df_designs_copy[seq_col].apply(lambda x: "".join([aa for i, aa in enumerate(x) if design_mask[i]]))
         return df_designs_copy
 
 
@@ -98,16 +110,19 @@ class RankDesign():
 
         # Initialize the boolean DataFrame with the same index as the input DataFrame. Prevents misalignment when checking Threshold Pass/Fail
         df_bool = pd.DataFrame(index=df_designs.index)
+        num_filters = 0
     
         # Iterate through the metrics and thresholds
         for metric, threshold in self.metric_threshold_dict.items():
             if metric in df_designs.columns:
                 # Create a Boolean column for the metric
                 df_bool[metric] = df_designs[metric] >= threshold
+                num_filters += 1
             else:
                 print(f"Warning: Metric {metric} not used as a filter. Skipping...")
         
         # Add a column for the number of filters passed
+        print(f"Total Number of Filters Used: ", num_filters)
         df_bool['num_filters_passed'] = df_bool.sum(axis=1)
         df_bool[seq_col] = df_designs[seq_col]
 
@@ -200,9 +215,9 @@ class RankDesign():
         Returns:
             float: Diversity score between two sequences
         """
-        assert len(seq_a) == len(seq_b), "Sequences must be of equal length"
+    
         lev_distance = Levenshtein.distance(seq_a, seq_b)
-        diversity_score = lev_distance / len(seq_a)
+        diversity_score = lev_distance / max(len(seq_a), len(seq_b))
         return diversity_score
 
     def get_top_n_diverse_designs(self, df_design_ranked: pd.DataFrame, top_n: int, alpha: float = 0.1) -> pd.DataFrame:
@@ -298,14 +313,16 @@ class RankDesign():
         df_top_designs['design_score'] = design_scores
         return df_top_designs
     
-    def run_filter_rank_pipeline(self, df_designs: pd.DataFrame, design_mask: np.ndarray, top_n: int, alpha: float = 0.1,
-                                 seq_col: str = 'sequence'):
+    def run_filter_rank_pipeline(self, df_designs: pd.DataFrame, top_n: int, alpha: float = 0.1, seq_col: str = 'sequence', design_mask: Optional[np.ndarray] = None):
         """ Run the entire Protein Design Filtering & Ranking Pipeline 
             Args:
                 df_designs (Pandas DataFrame): A dataframe containing the designs to be filtered and ranked
                 top_n (int): The number of top designs to return
                 alpha (float): The weight of the diversity score in the design score 
                                (Higher alpha = greater diversity, but lower quality)
+                seq_col (str): The name of the column containing the sequences of the designs
+                design_mask (np.ndarray): A boolean mask viable for each seq in df_designs and is used to capture the actual component of the seqs designed by the models
+                                          (Example: Specifies the scaffold and not the motif) Used to calculate similarity scores based on AA composition for the designs
             Returns:
                 Pandas DataFrame: A dataframe containing the top_n designs filtered and ranked
         """
