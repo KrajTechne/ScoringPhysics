@@ -139,7 +139,7 @@ def compute_surface_hydrophobicity(pdb_file_path: str, binder_chain_id: str = "A
     return surface_hydrophobicity
 
 def analyze_interface(pose: pr.Pose, epi_residues: list, temp_pdb_file_path: str, binder_chain_id: str = "A", target_chain_id: str = "B",
-                      cutoff: float = 4.5) -> dict:
+                      cutoff: float = 4.5, linker: bool = True) -> dict:
     """ Analyzes the interface of a PyRosetta Relaxed pose using PyRosetta's InterfaceAnalyzerMover """
 
     contact_information = determine_binding_interface(pdb_file_path = temp_pdb_file_path, desired_epitope_residues = epi_residues,
@@ -171,7 +171,7 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, temp_pdb_file_path: str
     interface_dG_SASA_ratio = interface_score.dG_dSASA_ratio * 100
 
     # Calculate surface hydrophobicity
-    surface_hydrophobicity = compute_surface_hydrophobicity(pdb_file_path = temp_pdb_file_path, binder_chain_id = binder_chain_id, target_chain_id = target_chain_id)
+    surface_hydrophobicity = compute_surface_hydrophobicity(pdb_file_path = temp_pdb_file_path, binder_chain_id = binder_chain_id, target_chain_id = target_chain_id, linker = linker)
     # Save output in a dictionary
     interface_metrics = {
         "interface_sc": interface_sc,
@@ -188,7 +188,7 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, temp_pdb_file_path: str
 
 def run_relaxation_and_physics_scoring_single_pdb(pdb_file_path: str, epi_residues: list,rmsd_inputs: dict = {},
                                                   binder_chain_id: str = "A", target_chain_id: str = "B", 
-                                                  save_relaxed: bool = False, cutoff: float = 4.5):
+                                                  save_relaxed: bool = False, cutoff: float = 4.5, linker: bool = True):
     """ Runs relaxation and physics scoring on a single PDB File containing a promising design from structure-based design workflow """
     #print(f"Processing PDB file: {pdb_file_path}")
     # 1. Relax PDB File
@@ -200,7 +200,7 @@ def run_relaxation_and_physics_scoring_single_pdb(pdb_file_path: str, epi_residu
         relaxed_pose.dump_pdb(temp_pdb_file_path)
         # 3. Calculate Interface Metrics
         interface_metrics = analyze_interface(pose= relaxed_pose, temp_pdb_file_path= temp_pdb_file_path, 
-                                              epi_residues= epi_residues, binder_chain_id= binder_chain_id, target_chain_id= target_chain_id)
+                                              epi_residues= epi_residues, binder_chain_id= binder_chain_id, target_chain_id= target_chain_id, linker= linker)
         # 4. Calculate RMSD between relaxed holo and apo structures (only if rmsd_inputs is provided)
         required_keys = {'filepath_apo', 'align_mask', 'measure_mask'}
         if required_keys.issubset(rmsd_inputs.keys()): # Returns True if required_keys are present, even if others exist
