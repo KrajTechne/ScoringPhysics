@@ -178,11 +178,11 @@ def analyze_structure(pred_struc, volume_save_path: str, design_name: str, model
     # 2. Save confidence metrics
     if num_targets == 0:
         # If apo:
-        metrics.update({"ptm" : predicted_structure.ptm, "plddt" : predicted_structure.plddt.mean()})
+        metrics.update({"ptm" : predicted_structure.ptm, "plddt" : predicted_structure.plddt.mean().item()})
     else:
         # If holo:
         # 1. Update complex-specific metrics
-        metrics.update({"iptm" : predicted_structure.iptm, "complex_plddt" : predicted_structure.plddt.mean(), "ptm" : predicted_structure.ptm})
+        metrics.update({"iptm" : predicted_structure.iptm, "complex_plddt" : predicted_structure.plddt.mean().item(), "ptm" : predicted_structure.ptm})
         
         # 2. Conduct contact check
         target_chain_id = ",".join(chr(ord("B") + i) for i in range(num_targets))
