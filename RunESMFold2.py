@@ -16,8 +16,8 @@ from esm.models.esmfold2 import (
 )
 from esm.utils.msa import MSA
 from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
-from StrucTools import calculate_ipSAE, determine_binding_interface, extract_atom_array
-from mmseqs2 import generate_msa
+from .StrucTools import calculate_ipSAE, determine_binding_interface, extract_atom_array
+from .mmseqs2 import generate_msa
 
 _model_cache: dict = {}
 

@@ -1,5 +1,6 @@
-import torch
 import gemmi
+import subprocess
+import pandas as pd
 import numpy as np
 import biotite.sequence as seq
 import biotite.structure as struc
