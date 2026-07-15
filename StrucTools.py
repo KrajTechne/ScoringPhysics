@@ -1,6 +1,5 @@
 import torch
 import gemmi
-import py2Dmol
 import numpy as np
 import biotite.sequence as seq
 import biotite.structure as struc
@@ -232,7 +231,8 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
     
     # Return specific chain's heavy atoms' atom array
     binder_atom_array = holo_atom_array[(holo_atom_array.chain_id == binder_chain_id) & (holo_atom_array.element != "H")]
-    target_atom_array = holo_atom_array[(holo_atom_array.chain_id == target_chain_id) & (holo_atom_array.element != "H")]
+    target_chain_ids = [chain.strip() for chain in str(target_chain_id).split(",") if chain.strip()]
+    target_atom_array = holo_atom_array[np.isin(holo_atom_array.chain_id, target_chain_ids) & (holo_atom_array.element != "H")]
 
     # Create ROI Cell List: Based on target atom array
     # Create target_binder_adjacency_matrix (shape): (# of Target Heavy atoms, # of Binder Heavy atoms)
@@ -291,16 +291,16 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
 
     contact_information = {
         "binder_chain": binder_chain_id,
-        "target_chain": target_chain_id,
-        "paratope_indices": paratope_indices_str,
-        "paratope_length": paratope_length,
-        "paratope_1aa": paratope_1aa,
-        "epitope_indices": epitope_indices_str,
-        "epitope_length": epitope_length,
-        "epitope_1aa": epitope_1aa,
-        "epitope_coverage_recall": recall,
-        "epitope_coverage_precision": precision,
-        "epitope_coverage_f1": f1_score
+        "target_chain": ",".join(target_chain_ids),
+        f"paratope_indices_{target_chain_id}": paratope_indices_str,
+        f"paratope_length_{target_chain_id}": paratope_length,
+        f"paratope_1aa_{target_chain_id}": paratope_1aa,
+        f"epitope_indices_{target_chain_id}": epitope_indices_str,
+        f"epitope_length_{target_chain_id}": epitope_length,
+        f"epitope_1aa_{target_chain_id}": epitope_1aa,
+        f"epitope_coverage_recall_{target_chain_id}": recall,
+        f"epitope_coverage_precision_{target_chain_id}": precision,
+        f"epitope_coverage_f1_{target_chain_id}": f1_score
     }
     return contact_information
 
@@ -353,7 +353,29 @@ def run_superimpose_and_calculate_rmsd_apo_holo_pipeline(pdb_file_path_holo: str
     return rmsd, aligned_alpha_carbons_binder, align_transformation
 
 #----------------------------------------- Predicted Structure Metrics----------------------------------------------------------
-def calculate_ipsae_complex(pae_matrix, len_binder: int, pae_cutoff: int = 15, verbose = True): 
+def calculate_ipSAE(pae_file: str, binder_chain: str, target_chains: str, path_input_structure: str, pae_threshold: str = "10", dist_threshold: str = "15",) -> dict:
+    """Run ipsae CLI and return per-target-chain ipSAE and pDockQ scores."""
+    cmd = ["ipsae", str(pae_file), path_input_structure, pae_threshold, dist_threshold]
+    subprocess.run(cmd, check=True)
+
+    ipsae_file = pae_file.replace(".npz", f"_{pae_threshold}_{dist_threshold}.txt").replace("pae_", "")
+    df_tmp = pd.read_csv(ipsae_file, sep=r"\s+", header=0)
+
+    score_dict = {}
+    for chain in target_chains.split(","):
+        chain = chain.strip()
+        if not chain:
+            continue
+        pair_mask = (
+            ((df_tmp["Chn1"] == binder_chain) & (df_tmp["Chn2"] == chain))
+            | ((df_tmp["Chn2"] == binder_chain) & (df_tmp["Chn1"] == chain))
+        )
+        df_pair = df_tmp[pair_mask]
+        score_dict[f"ipSAE_{chain}"] = df_pair["ipSAE"].min()
+        score_dict[f"pDockQ_{chain}"] = df_pair["pDockQ"].min()
+    return score_dict
+
+def calculate_ipsae_complex_poc(pae_matrix, len_binder: int, pae_cutoff: int = 15, verbose = True): 
     """
         Calculate the ipsae score for a given pae matrix
         Assumption: 
@@ -421,17 +443,60 @@ def calculate_ipsae_complex(pae_matrix, len_binder: int, pae_cutoff: int = 15, v
     return ipsae_min, ipsae_max
 
 #--------------------------------------------------------------------------- Visualize Structures-------------------------------------
-def visualize_structure(structure_path: str):
+def visualize_structure_py2dmol(structure_path: str, width: int = 800, height: int = 600, controls: bool = True):
     """
+    View structure via py2Dmol (Useful for glancing thru structures, but not for understanding true 3D representation)
     Args:
         - structure_path (str): Path to the structure to be visualized
     Returns:
-        - None
+        - viewer (py2Dmol.view): py2Dmol viewer
      """
-    viewer = py2Dmol.view()
+    
+    import py2Dmol
+    viewer = py2Dmol.view(size = (width, height), controls = controls)
     viewer.add_pdb(structure_path)
     viewer.show()
-    
+    return viewer
+
+def visualize_structure_molview(structure_path: str, width: int = 800, height: int = 600, panel: bool = True):
+    """
+    View structure via molview (Useful for visualizing secondary structure and understanding true 3D representation)
+    Args:
+        - structure_path (str): Path to the structure to be visualized
+        - width (int): Width of the visualization
+        - height (int): Height of the visualization
+        - panel (bool): Whether to show the panel
+    Returns:
+        - viewer (molview.view): molview viewer
+    """
+    import molview as mv
+    viewer = mv.view(width = width, height = height, panel = panel)
+    with open(structure_path) as f:
+        viewer.addModel(f.read())
+    viewer.show()
+    return viewer
+
+def visualize_structure(structure_path: str, how: str = "py2Dmol", width: int = 800, height: int = 600, controls: bool = True):
+    """
+    View structure via py2Dmol (Useful for glancing thru structures, but not for understanding true 3D representation)
+    View structure via molview (Useful for visualizing secondary structure and understanding true 3D representation)
+    Args:
+        - structure_path (str): Path to the structure to be visualized
+        - how (str): How to visualize the structure (py2Dmol or molview)
+        - width (int): Width of the visualization
+        - height (int): Height of the visualization
+        - controls (bool): Whether to show the control panel
+    Returns:
+        - viewer (py2Dmol.view or molview.view)
+    """
+
+    if how == "py2Dmol":
+        return visualize_structure_py2dmol(structure_path, width = width, height = height, controls = controls)
+    elif how == "molview":
+        return visualize_structure_molview(structure_path, width = width, height = height, panel = controls)
+    else:
+        raise ValueError(f"Invalid visualization method: {how}. Supported methods: py2Dmol, molview")
+
 #------------------------------------------------------------------------- Convert PDB Files to CIF Files-------------------------------
 def convert_pdb_to_cif(input_pdb_path):
     """Adapts the logic from Boltz's parse_pdb to convert a PDB file to mmCIF."""
