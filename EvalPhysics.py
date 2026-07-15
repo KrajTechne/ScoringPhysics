@@ -10,6 +10,7 @@ import biotite.sequence as seq
 from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.core.kinematics import MoveMap
+from pyrosetta.rosetta.core.pose import DockingPartners
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from StrucTools import *
 from Scfv import Scfv
@@ -147,9 +148,9 @@ def analyze_interface(pose: pr.Pose, epi_residues: list, temp_pdb_file_path: str
                                                       cutoff= cutoff)
 
     # Initialize Interface Analyzer
-    interface_analyzer = InterfaceAnalyzerMover()
     interface_string = f"{binder_chain_id}_{target_chain_id}"
-    interface_analyzer.set_interface(interface_string)
+    dock_partners = DockingPartners.docking_partners_from_string(interface_string)
+    interface_analyzer = InterfaceAnalyzerMover(dock_partners)
     scorefunc = pr.get_fa_scorefxn()
     interface_analyzer.set_scorefunction(scorefunc)
     # Run Interface Analysis
