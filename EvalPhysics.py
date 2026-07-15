@@ -12,8 +12,7 @@ from pyrosetta.rosetta.protocols.simple_moves import AlignChainMover
 from pyrosetta.rosetta.core.kinematics import MoveMap
 from pyrosetta.rosetta.core.pose import DockingPartners
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
-from StrucTools import *
-from Scfv import Scfv
+from .StrucTools import *
 
 # Initialize PyRosetta
 # We use the same flags to ensure the scoring physics matches the original pipeline
@@ -111,6 +110,7 @@ def compute_surface_hydrophobicity(pdb_file_path: str, binder_chain_id: str = "A
     
     # Workflow for if the input is an scfv with linker and want surface hydrophobocity of non-linker regions or variable regions
     if linker:
+        from Scfv import Scfv
         # Annotate scfv using Scfv class and extract residue wise linker mask
         scfv_id = "scfv_1"
         scfv_obj = Scfv(verbose = False)
