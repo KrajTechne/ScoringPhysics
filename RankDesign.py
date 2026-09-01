@@ -5,51 +5,70 @@ import heapq
 from typing import Optional
 pd.options.mode.copy_on_write = True
 class RankDesign():
-    def __init__(self):
-        self.metric_threshold_dict = {'interface_sc' : 0.55,
-                                      'neg_interface_holo_apo_rmsd' : -1, # Negative because flipping all columns so higher is better
-                                      'surface_hydrophobicity' : 0.35,
+    def __init__(self, target_chains = ['B']):
+        # Base Dictionary of metrics and respective thresholds for success
+        self.metric_threshold_dict = {'neg_interface_holo_apo_rmsd' : -1, # Negative because flipping all columns so higher is better
                                       'parent_rmsd_cdr' : -1,
                                       'iptm' : 0.80,
                                       'ipsae_min' : 0.61,
                                       'ptm_apo' : 0.80,
                                       'plddt': 0.9,
                                       'iplddt': 0.9,
-                                      'epitope_coverage_recall' : 0.8, # Boltz2 Recall 
-                                      'epitope_coverage_precision' : 0.25, # Boltz2 Precision
-                                      'epitope_coverage_f1_chai' : 0.4, # Chai F1 score (Future needs to indicate this in metric)
                                       'heavy_hbond_freq' : 0.5,
                                       'light_hbond_freq' : 0.5} 
-        # Dictionary of metrics and respective weights in terms of design criteria importance (smaller value means more important
+        # Base Dictionary of metrics and respective weights in terms of design criteria importance (smaller value means more important)
         self.metrics_weights = {
                                 # Tier 1: Primary Success Metrics (Weight = 1) -----------------------------------------------------------------------------
-                                "neg_interface_dG": 1,              # Physics is king
                                 "iptm": 1,                          # Model confidence in the interface (OG: 1)
-                                "epitope_coverage_recall": 1,       # You want to prioritize hitting the target
-                                "epitope_coverage_f1_chai": 1,      # In Blind Validation, should still hit the target
                                 # Tier 2: Structural Quality (Weight = 2) ----------------------------------------------------------------------------------
                                 # These effectively count for "half" as much as Tier 1
-                                "iptm_chai": 2,                     # Structure Validation by different approach
-                                "interface_sc": 2,                  # Shape complementarity
-                                "neg_interface_dG_SASA_ratio": 2,   # Efficient binding
                                 "neg_interface_holo_apo_rmsd": 2,   # Smaller absolute value means less induced fit (Computed only over CDR & aligned on FR)
-                                "ptm_apo": 2,                       # Model confidence in the apo structure
-                                "epitope_coverage_precision": 2,    # Want to prioritize Recall (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
-                                "surface_hydrophobicity": 2,        # Want to minimize hydrophobicity on the surface otherwise will aggregate in the solvent
+                                "ptm_apo": 2,                       # Model confidence in the apo structure       
                                 # Tier 3: Nice-to-Haves (Weight = 3 or 4) ----------------------------------------------------------------------------------
                                 "parent_rmsd_cdr": 3,               # Ensure consistency between design and parent CDR regions
                                 "iplddt": 3,                        # Model confidence in the interface
-                                "binding_interface_hbonds": 4,      # Counts are noisy; high count doesn't always mean better
-                                "interface_packstat": 4,
                                  #----- Core Packing (Removal of disulfide bond heavily impacts stability so need good stability of binder) (Weight = 4.5 or 5)-------------
                                 "heavy_hbond_freq" : 4.5,
                                 "light_hbond_freq" : 4.5,
                                 "heavy_saltbridge_count" : 5,
                                 "light_saltbridge_count" : 5,
-                                
+            
                                 }
-        # Columns to flip signs for due to want all metrics to be formatted where higher value = better design
-        self.cols_to_flip = ['interface_dG', 'interface_dG_SASA_ratio', 'interface_holo_apo_rmsd', 'parent_rmsd_cdr']
+        # Base Columns to flip signs for due to want all metrics to be formatted where higher value = better design
+        self.cols_to_flip = ['interface_holo_apo_rmsd', 'parent_rmsd_cdr']
+
+        # ---------------------------------------------------
+        # 2. Update with Chain-Specific Parameters (Allows for scaling to multiple chain targets)
+        # ---------------------------------------------------
+        for chain in target_chains:
+            self.metric_threshold_dict.update({
+                f'interface_sc_{chain}' : 0.55,                 # Shape complementarity
+                f'epitope_coverage_recall_{chain}' : 0.8,       # Derived from designer structure prediction model (Boltz2)
+                f'epitope_coverage_precision_{chain}' : 0.25,   # Derived from designer structure prediction model (Boltz2)
+                f'epitope_coverage_f1_{chain}_esmfold2' : 0.8,  # Derived from validator structure prediction model (ESMFold2)
+                f'surface_hydrophobicity_{chain}' : 0.35,       
+                }
+            )
+            self.metrics_weights.update({
+                # Tier 1: Primary Success Metrics (Weight = 1) ------------------------------------------------
+                f'neg_interface_dG_{chain}': 1,                 # Physics is King
+                f'epitope_coverage_recall_{chain}': 1,          # Target Epitope Residue Prioritization
+                f'epitope_coverage_f1_{chain}_esmfold2' : 1,    # F1 (Hitting all the desired epitope residues, with decent precision so minimal off-target contacts)
+                
+                # Tier 2: Structural Quality     (Weight = 2) --------------------------------------------------
+                f'iptm_esmfold2' : 2,                           # Model confidence in interface from Validator Model (Typically ESMFold2)
+                f'interface_sc_{chain}' : 2,                    # Shape complementarity
+                f'neg_interface_dG_SASA_ratio_{chain}': 2,
+                f'epitope_coverage_precision_{chain}' : 2,      # Minimize off-target contacts
+                f'surface_hydrophobicity_{chain}' : 2,          # Want to minimize hydrophobicity on the surface otherwise will aggregate in the solvent
+
+                # Tier 3: Nice-to-Haves (Weight = 3 or 4) ----------------------------------------------------------------------------------
+                f'binding_interface_hbonds_{chain}' : 4,        # Counts are noisy; high count doesn't always mean better
+                f'interface_packstat_{chain}' : 4,
+            })
+            # Chain-specific columns to flip signs for due to want all metrics to be formatted where higher value = better design
+            self.cols_to_flip.extend([f'interface_dG_{chain}', f'interface_dG_SASA_ratio_{chain}'])
+    
     
     def update_threshold(self, metric:str, threshold:float):
         """ Update threshold for a given metric """
