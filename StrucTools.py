@@ -67,8 +67,8 @@ def clean_structure(struc_file_path):
         # 2. Iterate over current ligand chains, slice original atom_array_complex's chain ID and set chain ID to new_chain_id
         for index, curr_ligand_chain_id in enumerate(curr_ligand_chains):
             new_chain_id_ligand = chr(ord('A') + len(chain_starts) + index)
-            boolean_slice = atom_array_complex.chain_id == curr_ligand_chain_id
-            atom_array_complex.chain_id[boolean_slice] = new_chain_id_ligand
+            boolean_slice = atom_array_ligand.chain_id == curr_ligand_chain_id
+            atom_array_ligand.chain_id[boolean_slice] = new_chain_id_ligand
     
     # Create dictionary of chain id to seq and seq len for given chain (only for protein)
     dict_chain_seqs = {}
@@ -81,13 +81,19 @@ def clean_structure(struc_file_path):
             'seq_len': seq_len
         }
     
+    # Concatenate the atom_array_complex_protein and atom_array_complex_ligand to get final atom_array_complex
+    atom_array_complex = struc.concatenate([atom_array_complex_protein, atom_array_ligand])
+    print("Complex Chain IDs: ", struc.get_chains(atom_array_complex))
+
     # Clean residue numbering for each protein chain in the structure & standardize chain ID naming of A to len(protein_chains)
     # Final PDB will have protein chains in front with ligand at the end
+    print("Atom Array Complex Chain IDs: ", struc.get_chains(atom_array_complex))
     for index, chain_start_atom_index in enumerate(chain_starts):
 
         # Standardize Chain ID Naming from A to len(protein_chains)
         new_chain_id = chr(ord('A') + index)
         old_chain_id = atom_array_complex[chain_start_atom_index].chain_id
+        print(f"Old Chain ID: {old_chain_id} & Corresponding New Chain ID: {new_chain_id}")
         boolean_slice_chain = atom_array_complex.chain_id == old_chain_id
         atom_array_complex.chain_id[boolean_slice_chain] = new_chain_id
         chain_start_res_id = atom_array_complex[chain_start_atom_index].res_id
@@ -216,7 +222,7 @@ def superimpose_align_parent_design(struc_parent_path: str, struc_design_path: s
     return fr_cdr_rmsd 
 
 #------------------------------ Determine Binding Interface: Paratope, Epitope, Overlap on desired epitope residues --------------------------------------
-def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: list, binder_chain_id: str = "A", 
+def determine_binding_interface(pdb_file_path: str, hotspots: list, binder_chain_id: str = "A", 
                                 target_chain_id: str = "B", cutoff: float = 4.5) -> dict:
     """
         Answer and achieve these objectives:
@@ -225,6 +231,28 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
         3. Calculate percent of desired epitope residues covered by actual epitope (Desired Epitope % Coverage)
     """
     obj_protein_seq = seq.ProteinSequence()
+
+    # 0. Validate provided input format of hotspots
+    # If residues are provided in list of [f'{chain_id}{res_pos_1indexed}'], extract residues corresponding to specific target_chain_id
+    if any(map(lambda x: x[0].isalpha(), hotspots)):
+        print("Provided hotspots are in string format of chain_respos_1indexed")
+        desired_epitope_residues = [hotspot[1:] for hotspot in hotspots if hotspot[0] == target_chain_id]
+    # If residues are provided in list of [f'{res_pos_1indexed}'], extract residues as is 
+    elif all(map(lambda x: x.isnumeric(), hotspots)):
+        print("Provided hotspots are in string format of respos_1indexed")
+        desired_epitope_residues = hotspots 
+    # If residues provided are already integers
+    elif all(map(lambda x: type(x) == int, hotspots)):
+        print("Provided hotspots are all integer format of respos_1indexed")
+        desired_epitope_residues = hotspots
+    # If residues are not provided or user does not want to check whether desired epitope residues are being contacted, continue with empty list
+    elif hotspots == []:
+        print("No hotspots were provided, so no check for whether desired epitope residues are being contacted")
+        desired_epitope_residues = hotspots
+    # If none of the above, raise ValueError indicating desired_epitope_residues are not in expected format
+    else:
+        raise ValueError("Hotspots were not provided in any of the expected lists of chain_id__respos_1indexed, or respos_1indexed, or empty list")
+
     # Make sure list of integers for set intersection
     desired_epitope_residues = [int(x) for x in desired_epitope_residues] 
 
@@ -232,8 +260,7 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
     
     # Return specific chain's heavy atoms' atom array
     binder_atom_array = holo_atom_array[(holo_atom_array.chain_id == binder_chain_id) & (holo_atom_array.element != "H")]
-    target_chain_ids = [chain.strip() for chain in str(target_chain_id).split(",") if chain.strip()]
-    target_atom_array = holo_atom_array[np.isin(holo_atom_array.chain_id, target_chain_ids) & (holo_atom_array.element != "H")]
+    target_atom_array = holo_atom_array[(holo_atom_array.chain_id == target_chain_id) & (holo_atom_array.element != "H")]
 
     # Create ROI Cell List: Based on target atom array
     # Create target_binder_adjacency_matrix (shape): (# of Target Heavy atoms, # of Binder Heavy atoms)
@@ -292,7 +319,7 @@ def determine_binding_interface(pdb_file_path: str, desired_epitope_residues: li
 
     contact_information = {
         "binder_chain": binder_chain_id,
-        "target_chain": ",".join(target_chain_ids),
+        "target_chain": target_chain_id,
         f"paratope_indices_{target_chain_id}": paratope_indices_str,
         f"paratope_length_{target_chain_id}": paratope_length,
         f"paratope_1aa_{target_chain_id}": paratope_1aa,
