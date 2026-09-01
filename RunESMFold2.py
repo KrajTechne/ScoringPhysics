@@ -7,15 +7,14 @@ import pandas as pd
 import torch
 from esm.models.esmfold2 import (
     ESMFold2InputBuilder,
+    EsmFold2Model,
     LigandInput,
     Modification,
     ProteinInput,
     DNAInput,
-    RNAInput,
     StructurePredictionInput,
 )
 from esm.utils.msa import MSA
-from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
 from .StrucTools import calculate_ipSAE, determine_binding_interface, extract_atom_array
 from .mmseqs2 import generate_msa
 
@@ -28,11 +27,12 @@ def load_model(model_name: str = "ESMFold2"):
     if model_name not in ['ESMFold2', 'ESMFold2-Fast']:
         raise ValueError(f"Model name {model_name} not available on HuggingFace.")
     if model_name not in _model_cache:
-        _model_cache[model_name] = (ESMFold2Model.from_pretrained(f"biohub/{model_name}").cuda().eval())
+        _model_cache[model_name] = EsmFold2Model.from_pretrained(f"biohub/{model_name}", device = "cuda").eval()
     return _model_cache[model_name]
 
 def run_esmfold2_prediction(model_name: str, seq_list: list, msa_options: list, path_msa_folder: str, entity_type: list = [], ligand: list = [], 
-                            num_diffusion_samples: int = 5, num_loops: int = 10, num_sampling_steps: int = 150, seed = 0):
+                            num_diffusion_samples: int = 5, num_loops: int = 10, num_sampling_steps: int = 150, seed = 0, 
+                            reuse_msa: bool = True):
     """ 
     Predicts structure for provided seqs and/or ligand using ESMFold2 model.
 
@@ -48,6 +48,7 @@ def run_esmfold2_prediction(model_name: str, seq_list: list, msa_options: list, 
         num_loops (int): Number of loops to run. (Loops is somewhat analogous to recycles in AlphaFold2). Default is 10.
         num_sampling_steps (int): Number of sampling steps to run. Default is 150.
         seed (int): Seed for random number generator. Default is 0.
+        reuse_msa (bool): Indicates whether to reuse previously generated MSAs. Default is True.
 
     Returns:
         pred_structs: ESMFold2 object containing each structure and its associated metrics
@@ -84,16 +85,27 @@ def run_esmfold2_prediction(model_name: str, seq_list: list, msa_options: list, 
     # 3.5 Initialize yaml to record inputs to ESMFold2 Model:
     yaml_inputs = {"sequences" : []}
     for index in range(len(seq_list)):
-        # Check whether user specified MSA generation ---------------------------------------
+        # Check whether user specified MSA generation -----------------------------------------------------------
         if msa_options[index] == '':
             # Check whether user specified RNA or Protein as those only allow for MSA input
             if entity_type[index] not in ['protein', 'rna']:
                 raise ValueError(f"MSA generation is not supported for entity type: {entity_type[index]}.")
-            # Generate MSA
             chain_id = chains[index]
-            msa_path = generate_msa(chain_id = chain_id, sequence = seq_list[index], msa_dir = path_msa_folder)
-        elif msa_options[index] != 'empty':
-            # Assumed that the user provided a custom msa path for the sequence with msa path being an a3m file
+            # Check if MSA has been previously generated --------------------------------------------------------
+            if reuse_msa == True:
+                msa_path = os.path.join(path_msa_folder, f"msa_chain_{chain_id}.a3m")
+                # Check if MSA exists
+                if os.path.exists(msa_path):
+                    print(f"MSA for chain: {chain_id} exists, so loading from chain-specific MSA from MSA folder")
+                else:
+                    print(f"MSA for chain: {chain_id} does not exist, so generating MSA for chain: {chain_id} sequence")
+                    msa_path = generate_msa(chain_id = chain_id, sequence = seq_list[index], msa_dir = path_msa_folder)
+            # If user does not want to reuse MSA, then generate MSA for chain: {chain_id} sequence
+            else:
+                print(f"reuse_msa flag is {reuse_msa}, so generating MSA for chain: {chain_id} sequence")
+                msa_path = generate_msa(chain_id = chain_id, sequence = seq_list[index], msa_dir = path_msa_folder)
+        # Assume that the user provided a custom msa path for the sequence with msa path being an a3m file
+        elif ".a3m" in msa_options[index]:
             msa_path = msa_options[index]
         else:
             # No MSA generation
@@ -142,33 +154,34 @@ def run_esmfold2_prediction(model_name: str, seq_list: list, msa_options: list, 
                                                seed = seed)
     return pred_strucs, yaml_inputs
 
-def analyze_structure(pred_struc, volume_save_path: str, design_name: str, model_id: int, desired_epitope_residues: list, num_targets: int = 1):
+def analyze_structure(predicted_structure, volume_save_path: str, design_name: str, model_id: int, desired_epitope_residues: list, 
+                      seed: int, num_targets: int = 1):
     """
     Analyzes the predicted structure and saves the results to a dictionary of metrics associated with the design_name and model_id 
     Args:
-        pred_struc (StructurePrediction): Predicted structure from ESMFold2
+        predicted_structure (StructurePrediction): Predicted structure from ESMFold2
         volume_save_path (str): Path to folder in volume to save structure
         design_name (str): Name of the design
         model_id (int): ID of the model
         desired_epitope_residues (list): List of desired epitope residues
+        seed (int): Seed for initializing weights in protein structure prediction model (Track seed because different seeds can yield different results)
         num_targets (int): Number of target chains in complex to analyze
     Returns:
         metrics: Dictionary of metrics associated with the design_name and model_id
 
     """
-    metrics = {"design_id" : f"{design_name}_{model_id}", "design_name" : design_name, "model_id" : model_id}
+    metrics = {"design_id" : f"{design_name}_seed_{seed}_model_{model_id}", "design_name" : design_name, "model_id" : model_id, "seed" : seed}
 
     # Save the predicted structure to a CIF file in the volume_save_path
     # Volume_save_path points to overarching folder, each design_name gets subfolder, and each model_id is saved within respective design_name folder
     # 1. Save predicted structure & associated paths
-    predicted_structure = pred_struc[model_id]
-    path_predicted_structure = os.path.join(volume_save_path, design_name, f"{design_name}_model_{model_id}.cif")
+    path_predicted_structure = os.path.join(volume_save_path, f"{design_name}_seed_{seed}_model_{model_id}.cif")
     path_predictions = os.path.dirname(path_predicted_structure)
     with open(path_predicted_structure, "w") as f:
         f.write(predicted_structure.complex.to_mmcif())
     
     # 1.5 Save predicted structure's pae matrix: Workaround required to address writing to volume isssue
-    path_predicted_structure_pae = os.path.join(volume_save_path, design_name, f"{design_name}_model_{model_id}_pae.npz")
+    path_predicted_structure_pae = os.path.join(volume_save_path, f"{design_name}_seed_{seed}_model_{model_id}_pae.npz")
     pae_matrix = predicted_structure.pae
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_npz_stem = os.path.join(tmpdir, 'pae')
@@ -185,21 +198,27 @@ def analyze_structure(pred_struc, volume_save_path: str, design_name: str, model
         metrics.update({"iptm" : predicted_structure.iptm, "complex_plddt" : predicted_structure.plddt.mean().item(), "ptm" : predicted_structure.ptm})
         
         # 2. Conduct contact check
-        target_chain_id = ",".join(chr(ord("B") + i) for i in range(num_targets))
-        contact_information = determine_binding_interface(pdb_file_path = path_predicted_structure,
-                                                          desired_epitope_residues = desired_epitope_residues,
-                                                          binder_chain_id = "A",
-                                                          target_chain_id = target_chain_id)
-        metrics.update(contact_information)
-        # 3. Calculate ipSAE
+        target_chains = ','.join(chr(ord('B') + i) for i in range(num_targets))
+        print("target_chains: ", target_chains)
+        for target_chain_id in target_chains.split(','):
+            hotspots = [hotspot[1:] for hotspot in desired_epitope_residues if hotspot[0] == target_chain_id]
+            print("Target chain: ", target_chain_id)
+            contact_information = determine_binding_interface(pdb_file_path= path_predicted_structure,
+                                                              hotspots= hotspots,
+                                                              binder_chain_id= "A", target_chain_id= target_chain_id)
+
+            # Append binding interface contacts information
+            metrics.update(contact_information)
+
+        # 3. Calculate ipSAE min and DockQ for each target chain
         ipsae_dict = calculate_ipSAE(pae_file = path_predicted_structure_pae,
                                      binder_chain = "A",
-                                     target_chains = target_chain_id,
+                                     target_chains = target_chains,
                                      path_input_structure = path_predicted_structure)
         ipsae_values = [value for key, value in ipsae_dict.items() if key.startswith("ipSAE_")]
         if ipsae_values:
-            ipsae_dict["ipsae_min"] = min(ipsae_values)
-            ipsae_dict["ipsae_max"] = max(ipsae_values)
+            ipsae_dict["ipsae_min"] = min(ipsae_values) # Min of the ipsae_min for all target chains in the complex
+            ipsae_dict["ipsae_max"] = max(ipsae_values) # Max of the ipsae_min for all target chains in the complex
         metrics.update(ipsae_dict)
     
     # 3. Add paths to structure, predictions, and pae path
@@ -236,15 +255,34 @@ def esmfold2_predict_analyze(design_name: str, model_name: str, volume_save_path
     if not os.path.exists(path_msa_folder):
       os.makedirs(path_msa_folder)
       print(f"Created MSA Subfolder as not present in volume_save_path: {volume_save_path}")
-    # 1. Predict structure via ESMFold2 and generate yaml documenting inputs
-    pred_struc, input_yaml = run_esmfold2_prediction(model_name = model_name, seq_list = seq_list, msa_options = msa_options, path_msa_folder= path_msa_folder, 
-                                                     entity_type = entity_type, ligand = ligand, 
-                                                     num_diffusion_samples = num_models, num_loops = num_loops, num_sampling_steps = num_sampling_steps, seed = seed)
     
-    # 2. Create subdirectory under design_name to save predicted structures and pae matrices
-    path_design_structures_folder = os.path.join(volume_save_path, design_name)
+    # 1. Create subdirectory under design_name & seed to save predicted structures and pae matrices
+    output_folder_name = f"{design_name}_seed_{seed}"
+    path_design_structures_folder = os.path.join(volume_save_path, output_folder_name)
     if not os.path.exists(path_design_structures_folder):
-        os.makedirs(os.path.join(volume_save_path, design_name))
+        os.makedirs(path_design_structures_folder)
+    # 1.5 If already exists, read in metrics from previous run
+    else:
+        print(f"Design folder already exists: {path_design_structures_folder}, so skipping design")
+        path_metrics = os.path.join(path_design_structures_folder, "all_models_metrics.csv")
+        # 1.625: Read in metrics if structure prediction successfully completed
+        if os.path.exists(path_metrics):
+            df_metrics = pd.read_csv(path_metrics)
+            return df_metrics
+        # 1.75: If the structure prediction failed, attempt to predict structure for incomplete run
+        else:
+            print(f"Design folder exists but metrics not found: {path_metrics}, so will attempt to predict structure for incomplete run")
+    
+    # 2. Predict structure via ESMFold2 and generate yaml documenting inputs
+    pred_struc, input_yaml = run_esmfold2_prediction(model_name = model_name, seq_list = seq_list, msa_options = msa_options, 
+                                                     path_msa_folder= path_msa_folder, 
+                                                     entity_type = entity_type, ligand = ligand, 
+                                                     num_diffusion_samples = num_models, num_loops = num_loops, 
+                                                     num_sampling_steps = num_sampling_steps, seed = seed)
+    # Handle case where only one model is predicted, so pred_struc is no longer a list. Therefore, it needs to be converted to a list for iteration
+    if num_models == 1:
+        pred_struc = [pred_struc]
+    
 
     # 2.5 Save the input yaml file to path_design_structure_folder
     path_yaml = os.path.join(path_design_structures_folder, "input.yaml")
@@ -253,13 +291,21 @@ def esmfold2_predict_analyze(design_name: str, model_name: str, volume_save_path
     
     # 3. Analyze each diffusion sample structure
     metrics_list = []
-    for index in range(len(pred_struc)):
-        metrics = analyze_structure(pred_struc = pred_struc, volume_save_path = volume_save_path, design_name = design_name, model_id = index,
+    for model_id in range(len(pred_struc)):
+        # Extract predicted structure
+        predicted_structure = pred_struc[model_id]
+        # Analyze predicted structure
+        metrics = analyze_structure(predicted_structure = predicted_structure, volume_save_path = path_design_structures_folder, 
+                                    design_name = design_name, model_id = model_id, seed = seed,
                                     desired_epitope_residues = desired_epitope_residues, num_targets = num_targets)
+        # Append analysis to list
         metrics_list.append(metrics)
     
     # 4. Create pandas dataframe of metrics
     df_metrics = pd.DataFrame(metrics_list)
+    # 4.5 Add in correct target_chain
+    if num_targets > 1:
+        df_metrics["target_chain"] = ",".join([chr(ord('B') + index) for index in range(num_targets)])
     df_metrics.to_csv(os.path.join(path_design_structures_folder, "all_models_metrics.csv"), index = False)
 
     return df_metrics
