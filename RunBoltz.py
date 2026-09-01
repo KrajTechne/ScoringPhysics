@@ -9,7 +9,7 @@ import pandas as pd
 from StrucTools import *
 
 def create_boltz_yaml(design_name: str, seq_list: list, msa_options: list, template_paths: list, entity_type: list = [],
-                      ligand: str = ""):
+                      ligand: list = []):
     """ 
     Create YAML File for running structure prediction with Boltz 2
         Args:
@@ -53,16 +53,17 @@ def create_boltz_yaml(design_name: str, seq_list: list, msa_options: list, templ
         
             yaml_data["templates"].append(template_dict)
     
-    # Added because of potential to add ligands to modelling (Useful for modelling Magnesium ('[Mg+2]'))
-    if ligand != "":
-        ligand_index = chr(ord('A') + len(seq_list))
-        entity_dict = {
-            "ligand" : {
-                "id" : ligand_index,
-                "smiles" : ligand
+    # Added because of potential to add ligands to modelling (Useful for modelling Magnesium ('[Mg+2]') or Manganese ('[Mn+2']))
+    if ligand != []:
+        for index, lig in enumerate(ligand):
+            ligand_index = chr(ord('A') + len(seq_list) + index)
+            entity_dict = {
+                "ligand" : {
+                    "id" : ligand_index,
+                    "smiles" : lig
             }
-        }
-        yaml_data["sequences"].append(entity_dict)
+            }
+            yaml_data["sequences"].append(entity_dict)
     
     print("Yaml Data: --------------")
     print(yaml_data)
@@ -114,8 +115,8 @@ def run_boltz_prediction(design_name: str, temp_save_dir: str, yaml_save_path: s
     # dirs_exist_ok=True allows it to overwrite/merge if the folder already exists
     shutil.copytree(temp_save_dir, volume_save_path, dirs_exist_ok=True)
 
-def analyze_structure(volume_save_path: str, design_name: str, model_id: int, len_binder: int,  desired_epitope_residues: list = [],
-                      contact_ipsae_check = True):
+def analyze_structure(volume_save_path: str, design_name: str, model_id: int, hotspots: list = [],
+                      contact_ipsae_check = True, num_targets: int = 1):
     """
         Analyze the structure of a given design
         Args:
@@ -140,21 +141,29 @@ def analyze_structure(volume_save_path: str, design_name: str, model_id: int, le
 
     # Major 3: Determine Binding Interface Metrics & Do Ipsae Calculations
     if contact_ipsae_check:
-        contact_information_a_b = determine_binding_interface(pdb_file_path= structure_path,
-                                                              desired_epitope_residues= desired_epitope_residues,
-                                                              binder_chain_id= "A", target_chain_id= "B")
+        # 3.1: Determine binding interface metrics: Iterate through each target chain and determine binding interface metrics
+        target_chains = ','.join(chr(ord('B') + i) for i in range(num_targets))
+        print("target_chains: ", target_chains)
+        for target_chain_id in target_chains.split(','):
+            hotspots = [hotspot[1:] for hotspot in desired_epitope_residues if hotspot[0] == target_chain_id]
+            print("Target chain: ", target_chain_id)
+            contact_information = determine_binding_interface(pdb_file_path= path_predicted_structure,
+                                                              hotspots= hotspots,
+                                                              binder_chain_id= "A", target_chain_id= target_chain_id)
 
-        # Append binding interface contacts information
-        metrics.update(contact_information_a_b)
+            # Append binding interface contacts information
+            metrics.update(contact_information)
 
-        # 3. Calculate ipsae metrics from PAE matrix
-        pae_matrix = np.load(pae_path)['pae']
-    
-        # 4. Calculate ipsae
-        ipsae_min, ipsae_max = calculate_ipsae_complex(pae_matrix=pae_matrix, len_binder=len_binder, pae_cutoff=15)
-        ipsae_dict = {"ipsae_min": ipsae_min, "ipsae_max": ipsae_max}
-        
-        # Append Ipsae metrics information
+        ipsae_dict = calculate_ipSAE(
+            pae_file=pae_path,
+            binder_chain="A",
+            target_chains=target_chains,
+            path_input_structure=structure_path,
+        )
+        ipsae_values = [value for key, value in ipsae_dict.items() if key.startswith("ipSAE_")]
+        if ipsae_values:
+            ipsae_dict["ipsae_min"] = min(ipsae_values)
+            ipsae_dict["ipsae_max"] = max(ipsae_values)
         metrics.update(ipsae_dict)
 
     # Major 4. Add paths to structure, predictions, confidence, pae matrices
@@ -164,7 +173,7 @@ def analyze_structure(volume_save_path: str, design_name: str, model_id: int, le
     return metrics
 
 def boltz_predict_analyze(design_name: str, volume_save_path: str, seq_list: list, msa_options: list = [],
-                          template_paths: list = [], entity_type: list = [], desired_epitope_residues: list = [], num_models: int = 5, kernels: bool = True, ligand = ""):
+                          template_paths: list = [], entity_type: list = [], hotspots: list = [], num_models: int = 5, kernels: bool = True, ligand = []):
     """
     Args:
             - design_name (str): Unique ID indicating what protein or set of proteins are being predicted structures
@@ -174,12 +183,13 @@ def boltz_predict_analyze(design_name: str, volume_save_path: str, seq_list: lis
             - template_paths (list): List of template paths for each sequence
             - entity_type (list): List of entity types for each sequence (Protein, DNA, nucleic acid) assumption typically proteins
             - num_models (int): Number of models to predict for each sequence
+            - hotspots (list): List of f"{chain_id}{1-indexed_res_id}" for all hotspots in the complex (empty = no hotspots)
+            - kernels (bool): Whether to use kernels or not (Use if T4, but not if A100)
         Returns:
             - metrics_design (pd.DataFrame): Pandas DataFrame of metrics for all predicted models for given design
     """
     # Setup for IPSAE calculations
-    binder_seq = seq_list[0] # Always binder seq first and then target
-    len_binder = len(binder_seq)
+    num_targets = len(seq_list) - 1
     # If len(seq_list) == 1, so only apo prediction, then no point to do contact and ipsae calculations
     if len(seq_list) == 1:
         contact_ipsae_check = False
@@ -194,8 +204,8 @@ def boltz_predict_analyze(design_name: str, volume_save_path: str, seq_list: lis
     metrics_design = []
     for model_id in range(num_models):
         metrics = analyze_structure(volume_save_path=volume_save_path, design_name=design_name, model_id=model_id,
-                                    desired_epitope_residues=desired_epitope_residues, len_binder=len_binder, 
-                                    contact_ipsae_check = contact_ipsae_check)
+                                    hotspots=hotspots,
+                                    contact_ipsae_check = contact_ipsae_check, num_targets=num_targets)
         metrics_design.append(metrics)
     
     # Convert to DataFrame and save as csv
