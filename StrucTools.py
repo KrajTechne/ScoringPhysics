@@ -233,21 +233,24 @@ def determine_binding_interface(pdb_file_path: str, hotspots: list, binder_chain
     obj_protein_seq = seq.ProteinSequence()
 
     # 0. Validate provided input format of hotspots
-    # If residues are provided in list of [f'{chain_id}{res_pos_1indexed}'], extract residues corresponding to specific target_chain_id
-    if any(map(lambda x: x[0].isalpha(), hotspots)):
-        print("Provided hotspots are in string format of chain_respos_1indexed")
-        desired_epitope_residues = [hotspot[1:] for hotspot in hotspots if hotspot[0] == target_chain_id]
-    # If residues are provided in list of [f'{res_pos_1indexed}'], extract residues as is 
-    elif all(map(lambda x: x.isnumeric(), hotspots)):
-        print("Provided hotspots are in string format of respos_1indexed")
-        desired_epitope_residues = hotspots 
-    # If residues provided are already integers
+    # If residues are not provided (or the caller doesn't want a desired-epitope check), continue with
+    # empty list. Checked first since all()/any() over an empty list are vacuously True/False and would
+    # otherwise get intercepted by the numeric/int branches below before ever reaching this case.
+    if not hotspots:
+        print("No hotspots were provided, so no check for whether desired epitope residues are being contacted")
+        desired_epitope_residues = hotspots
+    # If residues provided are already integers. Checked before the string-based branches since x[0]/x.isnumeric()
+    # would raise on an int element rather than correctly falling through to this branch.
     elif all(map(lambda x: type(x) == int, hotspots)):
         print("Provided hotspots are all integer format of respos_1indexed")
         desired_epitope_residues = hotspots
-    # If residues are not provided or user does not want to check whether desired epitope residues are being contacted, continue with empty list
-    elif hotspots == []:
-        print("No hotspots were provided, so no check for whether desired epitope residues are being contacted")
+    # If residues are provided in list of [f'{chain_id}{res_pos_1indexed}'], extract residues corresponding to specific target_chain_id
+    elif any(map(lambda x: x[0].isalpha(), hotspots)):
+        print("Provided hotspots are in string format of chain_respos_1indexed")
+        desired_epitope_residues = [hotspot[1:] for hotspot in hotspots if hotspot[0] == target_chain_id]
+    # If residues are provided in list of [f'{res_pos_1indexed}'], extract residues as is
+    elif all(map(lambda x: x.isnumeric(), hotspots)):
+        print("Provided hotspots are in string format of respos_1indexed")
         desired_epitope_residues = hotspots
     # If none of the above, raise ValueError indicating desired_epitope_residues are not in expected format
     else:
@@ -274,7 +277,6 @@ def determine_binding_interface(pdb_file_path: str, hotspots: list, binder_chain
     target_contact_atom_array = target_atom_array[contact_atom_indices_target]
     binder_contact_atom_array = binder_atom_array[contact_atom_indices_binder]
     
-
     epitope_indices, epitope_3aa = struc.get_residues(target_contact_atom_array)
     paratope_indices, paratope_3aa = struc.get_residues(binder_contact_atom_array)
         
