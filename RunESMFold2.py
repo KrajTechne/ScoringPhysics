@@ -197,6 +197,10 @@ def analyze_structure(predicted_structure, volume_save_path: str, design_name: s
         # 1. Update complex-specific metrics
         metrics.update({"iptm" : predicted_structure.iptm, "complex_plddt" : predicted_structure.plddt.mean().item(), "ptm" : predicted_structure.ptm})
         
+        # 1.5. Add binder-specific plddt
+        binder_tokens = np.asarray(predicted_structure.complex.chain_id) == 0
+        metrics["binder_plddt"] = float(np.asarray(predicted_structure.plddt.cpu())[binder_tokens].mean())
+        
         # 2. Conduct contact check
         target_chains = ','.join(chr(ord('B') + i) for i in range(num_targets))
         print("target_chains: ", target_chains)
