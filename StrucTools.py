@@ -7,14 +7,23 @@ import biotite.structure as struc
 import biotite.structure.io.pdb as pdb
 import biotite.structure.io.pdbx as pdbx
 
-def extract_atom_array(struc_file_path: str, ca_only = False):
-    """ Extract atom array from either CIF File or PDB File"""
+def extract_atom_array(struc_file_path: str, ca_only: bool = False, load_b_factor: bool = True):
+    """ Extract atom array from either CIF File or PDB File.
+        Preserves b_factor (used to store per-residue pLDDT in ESMFold2/Boltz2 outputs)
+        for visualization — biotite drops it by default unless requested via extra_fields.
+    """
     if struc_file_path.endswith(".cif"):
         pdbx_file = pdbx.CIFFile.read(struc_file_path)
-        atom_array = pdbx.get_structure(pdbx_file=pdbx_file, model = 1)
+        if load_b_factor:
+            atom_array = pdbx.get_structure(pdbx_file=pdbx_file, model = 1, extra_fields=["b_factor"])
+        else:
+            atom_array = pdbx.get_structure(pdbx_file=pdbx_file, model = 1)
     elif struc_file_path.endswith(".pdb"):
         pdb_file = pdb.PDBFile.read(struc_file_path)
-        atom_array = pdb_file.get_structure(model = 1)
+        if load_b_factor:
+            atom_array = pdb_file.get_structure(model = 1, extra_fields=["b_factor"])
+        else:
+            atom_array = pdb_file.get_structure(model = 1)
     else:
         raise ValueError("File must be either a PDB or CIF file")
     if ca_only:
@@ -268,7 +277,7 @@ def determine_binding_interface(pdb_file_path: str, hotspots: list, binder_chain
     # Create ROI Cell List: Based on target atom array
     # Create target_binder_adjacency_matrix (shape): (# of Target Heavy atoms, # of Binder Heavy atoms)
     roi_cell_list = struc.CellList(atom_array = target_atom_array, cell_size = cutoff)
-    target_binder_adjacency_matrix = roi_cell_list.get_atoms(binder_atom_array.coord, radius = cutoff, as_mask= True)
+    target_binder_adjacency_matrix = roi_cell_list.get_atoms(binder_atom_array.coord, radius = cutoff, as_mask = True) # as_mask = True valid for biotite version: 1.5. For version >1.5, it is result_format = result_format=CellList.Result.MASK
 
     # Isolate Target's Heavy Contact Atoms Indices
     contact_atom_indices_target = np.any(target_binder_adjacency_matrix, axis = 0) # Collapse along axis 0 (target atoms)
